@@ -38,6 +38,10 @@ current_criteria = get_criteria()
 
 if "gemini_api_key" not in st.session_state:
     st.session_state["gemini_api_key"] = os.getenv("GEMINI_API_KEY", "")
+if "analysis_running" not in st.session_state:
+    st.session_state["analysis_running"] = False
+if "analysis_paused" not in st.session_state:
+    st.session_state["analysis_paused"] = False
 
 # --- BARRE LATÉRALE : CLÉ API GEMINI (AVEC BOUTON TEST) & CRITÈRES DE RECHERCHE ---
 with st.sidebar:
@@ -152,14 +156,41 @@ with st.sidebar:
             use_container_width=True,
         )
 
+    pending_now = get_pending_listings()
+    ctrl_col1, ctrl_col2 = st.columns(2)
+    with ctrl_col1:
+        stop_analysis_btn = st.button(
+            "⏸️ Stopper l'IA",
+            use_container_width=True,
+            help="Interrompt immédiatement l'analyse IA en cours en conservant toutes les annonces et résultats déjà enregistrés dans mandataire.db.",
+        )
+    with ctrl_col2:
+        resume_analysis_btn = st.button(
+            f"▶️ Reprendre ({len(pending_now)})",
+            use_container_width=True,
+            disabled=(len(pending_now) == 0),
+            help="Reprend l'analyse IA uniquement sur les annonces restantes en attente.",
+        )
+
+    if stop_analysis_btn:
+        st.session_state["analysis_running"] = False
+        st.session_state["analysis_paused"] = True
+        st.toast("⏸️ Analyse IA interrompue ! La base de données et les annonces sont intactes.", icon="⏸️")
+
+    if resume_analysis_btn:
+        st.session_state["analysis_paused"] = False
+        st.session_state["analysis_running"] = True
+
     if st.button("🗑️ Vider la base d'annonces", use_container_width=True):
+        st.session_state["analysis_running"] = False
         delete_all_listings()
         st.toast("Base de données vidée.", icon="🗑️")
         st.rerun()
 
 
-# --- ACTION : LANCEMENT DU PIPELINE DE RECHERCHE LIVE & ANALYSE IA ---
+# --- ACTION 1 : LANCEMENT DU SCRAPING LIVE ---
 if launch_search:
+    st.session_state["analysis_paused"] = False
     parsed_cities = [c.strip() for c in cities_text.split(",") if c.strip()]
     save_criteria(
         max_budget=max_budget,
@@ -175,7 +206,7 @@ if launch_search:
     )
     current_criteria = get_criteria()
 
-    with st.status("🔍 Scraping temps réel (SeLoger + Bien'ici + Agences & Orpi) et Tri IA...", expanded=True) as status_box:
+    with st.status("🔍 Collecte Live (SeLoger + Bien'ici + Agences & Orpi)...", expanded=True) as status_box:
         st.write(
             f"1️⃣ Interrogation en direct de **SeLoger.com**, **Bien'ici** (IAD, Safti, Citya, Square Habitat, Guy Hoquet, ERA, Sergic...) "
             f"et **Orpi** sur : **{', '.join(parsed_cities)}**..."
@@ -189,31 +220,59 @@ if launch_search:
             if upsert_listing(ad):
                 new_count += 1
 
-        st.write(
-            f"📥 Collecte Live terminée : **{stats['total']}** annonces réelles récupérées "
-            f"({stats.get('seloger', 0)} via SeLoger, {stats['bienici_agences']} via Bien'ici/Agences, {stats['orpi_direct']} via Orpi direct) — "
-            f"**{new_count}** nouvelle(s) insérée(s) en base."
-        )
-
         if reanalyze_existing:
             reset_all_listings_to_pending()
 
-        pending = get_pending_listings()
-        active_key = st.session_state["gemini_api_key"]
-        engine_label = "API Gemini (gemini-3.8-flash)" if active_key else "Moteur de règles local (sans clé API)"
-        st.write(f"🧠 Analyse et tri via **{engine_label}** sur **{len(pending)}** annonce(s)...")
-
-        progress = st.progress(0)
-        for idx, item in enumerate(pending):
-            analysis = analyze_listing(item, current_criteria, api_key=active_key)
-            update_listing_analysis(item["id"], analysis)
-            progress.progress((idx + 1) / max(1, len(pending)))
-
+        pending_after_scrape = get_pending_listings()
         status_box.update(
-            label=f"✅ Recherche Live et tri terminés ({len(pending)} annonces réelles analysées) !",
+            label=(
+                f"📥 Collecte terminée : {stats['total']} annonces récupérées "
+                f"({stats.get('seloger', 0)} SeLoger, {stats['bienici_agences']} Bien'ici, {stats['orpi_direct']} Orpi) — "
+                f"{new_count} nouvelles en base. Démarrage du tri IA sur {len(pending_after_scrape)} annonces..."
+            ),
             state="complete",
             expanded=False,
         )
+    st.session_state["analysis_running"] = True
+
+
+# --- ACTION 2 : EXÉCUTION DE L'ANALYSE IA (INTERRUPTABLE SANS PERTE DE BDD) ---
+if st.session_state.get("analysis_running") and not st.session_state.get("analysis_paused"):
+    pending = get_pending_listings()
+    if pending:
+        active_key = st.session_state["gemini_api_key"]
+        engine_label = "API Gemini (gemini-3.8-flash)" if active_key else "Moteur de règles local (sans clé API)"
+
+        info_col, stop_inline_col = st.columns([4, 1])
+        with info_col:
+            progress_bar = st.progress(0, text=f"🧠 Analyse IA ({engine_label}) : 0 / {len(pending)} annonces en attente...")
+        with stop_inline_col:
+            if st.button("⏹️ Interrompre l'analyse IA", type="secondary", use_container_width=True):
+                st.session_state["analysis_running"] = False
+                st.session_state["analysis_paused"] = True
+                st.rerun()
+
+        total_to_process = len(pending)
+        for idx, item in enumerate(pending):
+            # Chaque annonce est sauvegardée immédiatement en base SQLite (commit atomique)
+            analysis = analyze_listing(item, current_criteria, api_key=active_key)
+            update_listing_analysis(item["id"], analysis)
+            progress_bar.progress(
+                (idx + 1) / max(1, total_to_process),
+                text=f"🧠 Analyse IA ({engine_label}) : {idx + 1} / {total_to_process} — {item['city']} ({item['price']:,} €)".replace(",", " "),
+            )
+
+        st.session_state["analysis_running"] = False
+        st.success(f"✅ Tri IA terminé avec succès ({total_to_process} annonces analysées et enregistrées) !")
+    else:
+        st.session_state["analysis_running"] = False
+
+if st.session_state.get("analysis_paused"):
+    remaining = len(get_pending_listings())
+    st.warning(
+        f"⏸️ **Analyse IA interrompue à votre demande.** Vos annonces et analyses déjà effectuées sont sauvegardées dans `mandataire.db`. "
+        f"Il reste **{remaining}** annonce(s) en statut *En attente* (cliquez sur **▶️ Reprendre ({remaining})** dans la barre latérale quand vous le souhaitez)."
+    )
 
 
 # --- EN-TÊTE DU COCKPIT ---
@@ -239,16 +298,18 @@ if not all_listings:
 a_visiter_list = [x for x in all_listings if x["status"] == "a_visiter"]
 a_verifier_list = [x for x in all_listings if x["status"] == "a_verifier"]
 rejete_list = [x for x in all_listings if x["status"] == "rejete"]
+pending_list = [x for x in all_listings if x["status"] == "pending_analysis"]
 
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("🟢 À Visiter (Validées IA)", len(a_visiter_list))
 col2.metric("🟡 À Vérifier (À confirmer)", len(a_verifier_list))
 col3.metric("🔴 Ignorées / Rejetées (No-Go)", len(rejete_list))
+col4.metric("⏳ En attente d'analyse", len(pending_list))
 if a_visiter_list:
     avg_m2 = sum(x["price_per_m2"] or 0 for x in a_visiter_list) / len(a_visiter_list)
-    col4.metric("💶 Prix/m² moyen (À visiter)", f"{avg_m2:,.0f} €/m²".replace(",", " "))
+    col5.metric("💶 Prix/m² moyen (À visiter)", f"{avg_m2:,.0f} €/m²".replace(",", " "))
 else:
-    col4.metric("💶 Prix/m² moyen (À visiter)", "—")
+    col5.metric("💶 Prix/m² moyen (À visiter)", "—")
 
 st.divider()
 
@@ -265,13 +326,17 @@ with tab_cockpit:
     if all_listings:
         f_col1, f_col2, f_col3 = st.columns([2, 2, 1])
         with f_col1:
+            default_statuses = ["a_visiter", "a_verifier"]
+            if pending_list and not a_visiter_list and not a_verifier_list:
+                default_statuses.append("pending_analysis")
             status_choice = st.multiselect(
                 "Filtrer par décision IA",
-                options=["a_visiter", "a_verifier", "rejete"],
-                default=["a_visiter", "a_verifier"],
+                options=["a_visiter", "a_verifier", "pending_analysis", "rejete"],
+                default=default_statuses,
                 format_func=lambda s: {
                     "a_visiter": "🟢 À visiter (Opportunités)",
                     "a_verifier": "🟡 À vérifier (Infos manquantes)",
+                    "pending_analysis": "⏳ En attente d'analyse IA",
                     "rejete": "🔴 Rejeté (Critères No-Go)",
                 }.get(s, s),
             )
@@ -302,6 +367,8 @@ with tab_cockpit:
                 badge = f"🟢 **À VISITER** — Score IA : **{score}/10**"
             elif status == "a_verifier":
                 badge = f"🟡 **À VÉRIFIER** — Score IA : **{score}/10**"
+            elif status == "pending_analysis":
+                badge = "⏳ **EN ATTENTE D'ANALYSE IA**"
             else:
                 badge = f"🔴 **REJETÉ** — Score IA : **{score}/10**"
 
