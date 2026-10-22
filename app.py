@@ -6,9 +6,11 @@ from dotenv import load_dotenv, set_key
 
 from database import (
     delete_all_listings,
+    export_db_to_json,
     get_all_listings,
     get_criteria,
     get_pending_listings,
+    import_db_from_json,
     init_db,
     reset_all_listings_to_pending,
     save_criteria,
@@ -36,8 +38,18 @@ st.set_page_config(
 init_db()
 current_criteria = get_criteria()
 
+def _get_default_gemini_key() -> str:
+    """Récupère la clé Gemini depuis st.secrets (Streamlit Cloud) ou depuis les variables d'environnement (.env)."""
+    try:
+        if "GEMINI_API_KEY" in st.secrets:
+            return str(st.secrets["GEMINI_API_KEY"]).strip()
+    except Exception:
+        pass
+    return os.getenv("GEMINI_API_KEY", "").strip()
+
+
 if "gemini_api_key" not in st.session_state:
-    st.session_state["gemini_api_key"] = os.getenv("GEMINI_API_KEY", "")
+    st.session_state["gemini_api_key"] = _get_default_gemini_key()
 if "analysis_running" not in st.session_state:
     st.session_state["analysis_running"] = False
 if "analysis_paused" not in st.session_state:
@@ -186,6 +198,26 @@ with st.sidebar:
         delete_all_listings()
         st.toast("Base de données vidée.", icon="🗑️")
         st.rerun()
+
+    st.divider()
+    with st.expander("☁️ Sauvegarde / Restauration Cloud (JSON)"):
+        st.caption(
+            "Sur Streamlit Cloud, le disque se réinitialise en cas de mise en veille. "
+            "Téléchargez ou restaurez vos annonces et scores IA en 1 clic :"
+        )
+        st.download_button(
+            label="📥 Exporter la BDD (.json)",
+            data=export_db_to_json(),
+            file_name="mandataire_backup.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+        uploaded_backup = st.file_uploader("📤 Importer une sauvegarde (.json)", type=["json"])
+        if uploaded_backup is not None:
+            if st.button("Restaurer ce fichier", use_container_width=True):
+                restored_count = import_db_from_json(uploaded_backup.getvalue().decode("utf-8"))
+                st.success(f"✅ {restored_count} annonces restaurées !")
+                st.rerun()
 
 
 # --- ACTION 1 : LANCEMENT DU SCRAPING LIVE ---

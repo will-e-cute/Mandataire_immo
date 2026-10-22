@@ -235,3 +235,68 @@ def delete_all_listings() -> None:
     with get_connection() as conn:
         conn.execute("DELETE FROM listings")
         conn.commit()
+
+
+def export_db_to_json() -> str:
+    """Exporte les critères et toutes les annonces (avec leurs analyses IA) au format JSON (idéal pour sauvegarde Cloud)."""
+    init_db()
+    with get_connection() as conn:
+        criteria_row = conn.execute("SELECT * FROM search_criteria WHERE id = 1").fetchone()
+        listings_rows = conn.execute("SELECT * FROM listings ORDER BY id ASC").fetchall()
+        payload = {
+            "search_criteria": dict(criteria_row) if criteria_row else {},
+            "listings": [dict(r) for r in listings_rows],
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def import_db_from_json(json_str: str) -> int:
+    """Restaure les annonces et analyses IA depuis un export JSON sans écraser les doublons."""
+    init_db()
+    data = json.loads(json_str)
+    listings = data.get("listings", [])
+    restored = 0
+    with get_connection() as conn:
+        for item in listings:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO listings (
+                    external_id, source, url, title, property_type,
+                    price, surface, rooms, city, postal_code,
+                    description, dpe, has_parking, raw_json,
+                    status, ai_score, price_per_m2, ai_summary,
+                    ai_rejection_reason, ai_pros, ai_cons, ai_signals,
+                    ai_analysis_json, scraped_at, analyzed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item["external_id"],
+                    item.get("source", "Import"),
+                    item["url"],
+                    item["title"],
+                    item.get("property_type", "Autre"),
+                    int(item.get("price", 0)),
+                    float(item.get("surface", 0.0)),
+                    int(item.get("rooms", 0)),
+                    item.get("city", ""),
+                    item.get("postal_code", ""),
+                    item.get("description", ""),
+                    item.get("dpe", "Non renseigné"),
+                    item.get("has_parking"),
+                    item.get("raw_json", "{}"),
+                    item.get("status", "pending_analysis"),
+                    item.get("ai_score"),
+                    item.get("price_per_m2"),
+                    item.get("ai_summary"),
+                    item.get("ai_rejection_reason"),
+                    item.get("ai_pros", "[]") if isinstance(item.get("ai_pros"), str) else json.dumps(item.get("ai_pros", []), ensure_ascii=False),
+                    item.get("ai_cons", "[]") if isinstance(item.get("ai_cons"), str) else json.dumps(item.get("ai_cons", []), ensure_ascii=False),
+                    item.get("ai_signals", "[]") if isinstance(item.get("ai_signals"), str) else json.dumps(item.get("ai_signals", []), ensure_ascii=False),
+                    item.get("ai_analysis_json", "{}"),
+                    item.get("scraped_at"),
+                    item.get("analyzed_at"),
+                ),
+            )
+            restored += 1
+        conn.commit()
+    return restored
