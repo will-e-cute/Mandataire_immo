@@ -1,0 +1,17 @@
+# Environnement virtuel Python
+.venv/
+venv/
+ENV/
+
+# Secrets et variables d'environnement
+.env
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Base de données locale SQLite (optionnel : décommenter si vous ne souhaitez pas versionner mandataire.db)
+*.db-journal
+*.db-wal
+*.db-shm
