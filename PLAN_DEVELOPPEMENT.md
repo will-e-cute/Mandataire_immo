@@ -16,20 +16,23 @@ Développer une application autonome en local (via `.venv` Python, sans Docker) 
 | Composant | Technologie Retenue | Rôle dans le Système |
 | --- | --- | --- |
 | **Environnement** | Python 3.13 (`.venv` local) | Isolation complète des dépendances sans Docker. |
-| **Orchestration / Scraping** | Python (`httpx` / `BeautifulSoup` / `Playwright`) | Collecte multi-sources (Bien'ici, SeLoger, LeBonCoin) + mode simulation/import d'annonces. |
-| **Base de données** | SQLite (`mandataire.db` + `init.sql`) | Stockage relationnel local sans serveur, dédoublonnage par URL/ID et persistance des critères et analyses IA. |
-| **Moteur d'Analyse (IA)** | API Gemini (`google-genai` / `gemini-3.8-flash` & `litellm`) | Extraction structurée JSON (Pydantic) : Prix/m², DPE, présence stationnement, détection des "No-Go" et scoring sur 10. |
-| **Interface Utilisateur** | Streamlit (`app.py`) | Cockpit interactif avec panneau de configuration des critères, bouton **"Lancer la recherche"** et tableau de bord filtrable. |
+| **Orchestration / Scraping** | Python (`httpx` / `BeautifulSoup` / `Playwright`) | Collecte multi-sources (Bien'ici, SeLoger, LeBonCoin) + résilience anti-WAF automatique. |
+| **Base de données** | SQLite (`mandataire.db` + `init.sql`) | Stockage relationnel local sans serveur, dédoublonnage par URL/ID, persistance des critères, statuts CRM et quarantaine. |
+| **Moteur d'Analyse (IA)** | API Gemini (`gemini-3.8-flash` & fallback local) | Extraction structurée JSON (Pydantic) avec parallélisation multi-threads et circuit-breaker anti-quota. |
+| **Interface Utilisateur** | Streamlit (`app.py`) | Cockpit interactif avec gestion de sélection, suivi d'agences/visites, quarantaine restaurable et exports Excel/CSV. |
 
 ---
 
 ## 3. Pipeline de Données (Workflow)
 
 1. **Configuration dynamique :** L'utilisateur ajuste ses critères dans l'interface Streamlit (pré-remplis par défaut) et clique sur **"Lancer la recherche"**.
-2. **Collecte & Pré-filtrage :** Le scraper interroge les portails ciblés pour les communes sélectionnées, en filtrant selon le budget max et la surface minimale.
+2. **Collecte & Pré-filtrage :** Le scraper interroge les portails ciblés pour les communes sélectionnées, en filtrant selon le budget max et la surface minimale (avec fallback Playwright si blocage WAF / DataDome).
 3. **Dédoublonnage :** Chaque annonce est vérifiée dans `mandataire.db` via son identifiant unique / URL. Les nouvelles annonces sont insérées avec le statut `pending_analysis`.
-4. **Traitement IA (Prompt de Tri) :** Le moteur `ai_analyzer.py` analyse chaque annonce `pending_analysis` avec les critères actifs de l'utilisateur et retourne un JSON validé par schéma.
-5. **Restitution Cockpit :** Les annonces sont classées par statut (`À visiter`, `À vérifier`, `Rejeté`) et par score IA (de 0 à 10) avec mise en évidence des points forts et des alertes.
+4. **Traitement IA Parallélisé :** Le moteur `ai_analyzer.py` analyse en multi-threads les annonces avec les critères actifs et sauvegarde atomiquement chaque résultat en base.
+5. **Gestion & Suivi CRM :**
+   - **Sélection personnalisée :** Fiche dédiée avec suivi des contacts (`Contact oui/non`), programmation des visites (`Visite programmée oui/non`), nom de l'agence et téléphone (pré-remplissage automatique depuis la source et description).
+   - **Mise en Quarantaine :** Suppression réversible masquant les annonces indésirables du flux principal, avec onglet dédié permettant la restauration ou la purge définitive.
+6. **Restitution & Export :** Les annonces sont classées par statut et score IA avec export ciblé (Sélectionnées, Filtres, Pépites, Tout) en Excel (`.xlsx`) ou CSV France.
 
 ---
 
@@ -52,10 +55,21 @@ Développer une application autonome en local (via `.venv` Python, sans Docker) 
 
 ---
 
-## 5. Livrables du Projet
+## 5. Livrables et Améliorations Implémentées
 
-* `.venv/` & `requirements.txt` : Environnement virtuel Python local.
-* `init.sql` & `database.py` : Schéma relationnel SQLite et gestionnaire de requêtes / critères.
-* `system_prompt.md` & `ai_analyzer.py` : Compétence IA immobilière et intégration Gemini (`gemini-3.8-flash` avec sortie JSON structurée).
-* `scraper.py` : Moteur de collecte multi-sources pour les 5 villes cibles + injecteur d'annonces réalistes de test/fallback anti-blocage.
-* `app.py` & `run.ps1` : Application Streamlit complète avec contrôle des variables, lancement du pipeline en direct et cockpit de visualisation.
+* `.venv/` & `requirements.txt` : Environnement local incluant `openpyxl`, `playwright`, `httpx`, `pandas`, `streamlit`.
+* `init.sql` & `database.py` :
+  - Schéma SQLite relationnel avec migration dynamique au démarrage.
+  - Champs CRM et suivi (`is_selected`, `is_quarantined`, `contact_made`, `visit_scheduled`, `agency_name`, `agency_phone`, `followup_notes`).
+  - Dédoublonnage robuste à l'insertion et préservation des annotations utilisateur lors des réanalyses.
+* `system_prompt.md` & `ai_analyzer.py` :
+  - **Parallélisation multi-threads** (`analyze_listings_parallel`) avec `ThreadPoolExecutor` (1 à 8 workers configurables).
+  - **Circuit-breaker anti-quota** : bascule automatique et instantanée sur le moteur déterministe local en cas de saturation de quota Gemini (429).
+* `scraper.py` :
+  - **Bypass WAF & Anti-bot** : rotation de User-Agents récents et headers navigateurs réalistes.
+  - **Retries avec backoff exponentiel** sur requêtes HTTP `httpx`.
+  - **Bascule Playwright automatique** : utilisation de Chromium headless pour contourner les challenges DataDome / Cloudflare sur SeLoger, Bien'ici et Orpi.
+* `app.py` & `run.ps1` :
+  - **Gestion de la Sélection :** Onglet dédié avec indicateurs clés (contacts pris, visites programmées, budget moyen), formulaires interactifs de suivi agence et bouton d'appel direct.
+  - **Page Quarantaine :** Suppression douce masquant l'annonce du flux du marché, avec options de restauration unitaire ou globale, et purge définitive.
+  - **Exportation binaire double format enrichie** : Export Excel (`.xlsx`) et CSV France intégrant le statut de sélection et les informations agence/visite.
