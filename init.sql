@@ -50,6 +50,16 @@ CREATE TABLE IF NOT EXISTS listings (
     ai_cons TEXT DEFAULT '[]',
     ai_signals TEXT DEFAULT '[]',
     ai_analysis_json TEXT DEFAULT '{}',
+    -- Suivi utilisateur, sélection et quarantaine
+    is_selected INTEGER NOT NULL DEFAULT 0,
+    is_quarantined INTEGER NOT NULL DEFAULT 0,
+    contact_made INTEGER NOT NULL DEFAULT 0,
+    visit_scheduled INTEGER NOT NULL DEFAULT 0,
+    agency_name TEXT DEFAULT '',
+    agency_phone TEXT DEFAULT '',
+    followup_notes TEXT DEFAULT '',
+    selected_at TIMESTAMP DEFAULT NULL,
+    quarantined_at TIMESTAMP DEFAULT NULL,
     scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     analyzed_at TIMESTAMP DEFAULT NULL
 );
@@ -57,3 +67,5 @@ CREATE TABLE IF NOT EXISTS listings (
 CREATE INDEX IF NOT EXISTS idx_listings_status ON listings(status);
 CREATE INDEX IF NOT EXISTS idx_listings_score ON listings(ai_score DESC);
 CREATE INDEX IF NOT EXISTS idx_listings_city ON listings(city);
+CREATE INDEX IF NOT EXISTS idx_listings_selected ON listings(is_selected);
+CREATE INDEX IF NOT EXISTS idx_listings_quarantined ON listings(is_quarantined);
