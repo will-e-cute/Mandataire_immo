@@ -245,7 +245,10 @@ def fetch_page_content_playwright(url: str, timeout: float = 16.0) -> Optional[s
     """
     try:
         from playwright.sync_api import sync_playwright
+    except (ImportError, ModuleNotFoundError):
+        return None
 
+    try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,

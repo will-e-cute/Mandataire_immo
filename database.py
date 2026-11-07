@@ -439,3 +439,116 @@ def delete_all_listings() -> None:
     with get_connection() as conn:
         conn.execute("DELETE FROM listings")
         conn.commit()
+
+
+def export_db_to_json() -> str:
+    """Exporte les critères et toutes les annonces (avec suivi CRM et analyses IA) au format JSON."""
+    init_db()
+    with get_connection() as conn:
+        criteria_row = conn.execute("SELECT * FROM search_criteria WHERE id = 1").fetchone()
+        listings_rows = conn.execute("SELECT * FROM listings ORDER BY id ASC").fetchall()
+        payload = {
+            "search_criteria": dict(criteria_row) if criteria_row else {},
+            "listings": [dict(r) for r in listings_rows],
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def import_db_from_json(json_str: str) -> int:
+    """Restaure les critères, annonces et suivi IA/CRM depuis un export JSON sans écraser les doublons."""
+    init_db()
+    data = json.loads(json_str)
+
+    # Restauration éventuelle des critères
+    criteria = data.get("search_criteria")
+    if criteria and isinstance(criteria, dict):
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE search_criteria
+                SET max_budget = COALESCE(?, max_budget),
+                    min_surface = COALESCE(?, min_surface),
+                    property_types = COALESCE(?, property_types),
+                    cities = COALESCE(?, cities),
+                    require_parking = COALESCE(?, require_parking),
+                    exclude_dpe_fg = COALESCE(?, exclude_dpe_fg),
+                    exclude_occupied = COALESCE(?, exclude_occupied),
+                    exclude_heavy_works = COALESCE(?, exclude_heavy_works),
+                    exclude_copro_issues = COALESCE(?, exclude_copro_issues),
+                    custom_notes = COALESCE(?, custom_notes),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = 1
+                """,
+                (
+                    criteria.get("max_budget"),
+                    criteria.get("min_surface"),
+                    criteria.get("property_types") if isinstance(criteria.get("property_types"), str) else ",".join(criteria.get("property_types", [])),
+                    criteria.get("cities") if isinstance(criteria.get("cities"), str) else ",".join(criteria.get("cities", [])),
+                    criteria.get("require_parking"),
+                    criteria.get("exclude_dpe_fg"),
+                    criteria.get("exclude_occupied"),
+                    criteria.get("exclude_heavy_works"),
+                    criteria.get("exclude_copro_issues"),
+                    criteria.get("custom_notes"),
+                ),
+            )
+            conn.commit()
+
+    listings = data.get("listings", [])
+    restored = 0
+    with get_connection() as conn:
+        for item in listings:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO listings (
+                    external_id, source, url, title, property_type,
+                    price, surface, rooms, city, postal_code,
+                    description, dpe, has_parking, raw_json,
+                    status, ai_score, price_per_m2, ai_summary,
+                    ai_rejection_reason, ai_pros, ai_cons, ai_signals,
+                    ai_analysis_json,
+                    is_selected, is_quarantined, contact_made, visit_scheduled,
+                    agency_name, agency_phone, followup_notes,
+                    selected_at, quarantined_at, scraped_at, analyzed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item["external_id"],
+                    item.get("source", "Import"),
+                    item["url"],
+                    item["title"],
+                    item.get("property_type", "Autre"),
+                    int(item.get("price", 0)),
+                    float(item.get("surface", 0.0)),
+                    int(item.get("rooms", 0)),
+                    item.get("city", ""),
+                    item.get("postal_code", ""),
+                    item.get("description", ""),
+                    item.get("dpe", "Non renseigné"),
+                    item.get("has_parking"),
+                    item.get("raw_json", "{}"),
+                    item.get("status", "pending_analysis"),
+                    item.get("ai_score"),
+                    item.get("price_per_m2"),
+                    item.get("ai_summary"),
+                    item.get("ai_rejection_reason"),
+                    item.get("ai_pros", "[]") if isinstance(item.get("ai_pros"), str) else json.dumps(item.get("ai_pros", []), ensure_ascii=False),
+                    item.get("ai_cons", "[]") if isinstance(item.get("ai_cons"), str) else json.dumps(item.get("ai_cons", []), ensure_ascii=False),
+                    item.get("ai_signals", "[]") if isinstance(item.get("ai_signals"), str) else json.dumps(item.get("ai_signals", []), ensure_ascii=False),
+                    item.get("ai_analysis_json", "{}"),
+                    int(bool(item.get("is_selected", 0))),
+                    int(bool(item.get("is_quarantined", 0))),
+                    int(bool(item.get("contact_made", 0))),
+                    int(bool(item.get("visit_scheduled", 0))),
+                    item.get("agency_name", "") or "",
+                    item.get("agency_phone", "") or "",
+                    item.get("followup_notes", "") or "",
+                    item.get("selected_at"),
+                    item.get("quarantined_at"),
+                    item.get("scraped_at"),
+                    item.get("analyzed_at"),
+                ),
+            )
+            restored += 1
+        conn.commit()
+    return restored

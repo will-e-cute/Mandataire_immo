@@ -13,11 +13,13 @@ from database import (
     delete_all_listings,
     delete_listing_permanently,
     empty_quarantine,
+    export_db_to_json,
     get_all_listings,
     get_criteria,
     get_pending_listings,
     get_quarantined_listings,
     get_selected_listings,
+    import_db_from_json,
     init_db,
     reset_all_listings_to_pending,
     restore_all_quarantine,
@@ -49,8 +51,19 @@ st.set_page_config(
 init_db()
 current_criteria = get_criteria()
 
+
+def _get_default_gemini_key() -> str:
+    """Récupère la clé Gemini depuis st.secrets (Streamlit Cloud) ou depuis les variables d'environnement (.env)."""
+    try:
+        if "GEMINI_API_KEY" in st.secrets:
+            return str(st.secrets["GEMINI_API_KEY"]).strip()
+    except Exception:
+        pass
+    return os.getenv("GEMINI_API_KEY", "").strip()
+
+
 if "gemini_api_key" not in st.session_state:
-    st.session_state["gemini_api_key"] = os.getenv("GEMINI_API_KEY", "")
+    st.session_state["gemini_api_key"] = _get_default_gemini_key()
 if "analysis_running" not in st.session_state:
     st.session_state["analysis_running"] = False
 if "analysis_paused" not in st.session_state:
@@ -153,7 +166,7 @@ with st.sidebar:
         value=st.session_state["gemini_api_key"],
         type="password",
         placeholder="AIzaSy...",
-        help="Votre clé API est utilisée avec gemini-3.8-flash et peut être sauvegardée dans le fichier local .env.",
+        help="Votre clé API est utilisée avec gemini-3.8-flash (via st.secrets en Cloud ou .env en local).",
     )
     st.session_state["gemini_api_key"] = api_key_input.strip()
 
@@ -297,6 +310,26 @@ with st.sidebar:
         st.toast("Base de données vidée.", icon="🗑️")
         st.rerun()
 
+    st.divider()
+    with st.expander("☁️ Sauvegarde / Restauration Cloud (JSON)"):
+        st.caption(
+            "Sur Streamlit Cloud, le conteneur peut se réinitialiser lors des mises en veille. "
+            "Téléchargez ou restaurez vos annonces, sélections et suivis CRM en 1 clic :"
+        )
+        st.download_button(
+            label="📥 Exporter la BDD complète (.json)",
+            data=export_db_to_json(),
+            file_name=f"mandataire_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+        uploaded_backup = st.file_uploader("📤 Importer une sauvegarde (.json)", type=["json"])
+        if uploaded_backup is not None:
+            if st.button("Restaurer ce fichier", use_container_width=True):
+                restored_count = import_db_from_json(uploaded_backup.getvalue().decode("utf-8"))
+                st.success(f"✅ {restored_count} annonce(s) et critères restaurés avec succès !")
+                st.rerun()
+
 
 # --- ACTION 1 : LANCEMENT DU SCRAPING LIVE AVEC RÉSILIENCE WAF ---
 if launch_search:
@@ -316,7 +349,7 @@ if launch_search:
     )
     current_criteria = get_criteria()
 
-    with st.status("🔍 Collecte Live (SeLoger + Bien'ici + Agences & Orpi + Fallback Playwright)...", expanded=True) as status_box:
+    with st.status("🔍 Collecte Live (SeLoger + Bien'ici + Agences & Orpi + Fallback)...", expanded=True) as status_box:
         st.write(
             f"1️⃣ Interrogation en direct de **SeLoger.com**, **Bien'ici** (IAD, Safti, Citya, Square Habitat, Guy Hoquet, ERA, Sergic...) "
             f"et **Orpi** sur : **{', '.join(parsed_cities)}** (avec protection anti-WAF active)..."
@@ -413,7 +446,8 @@ quarantined_listings = get_quarantined_listings()
 
 # --- EN-TÊTE DU COCKPIT ---
 st.title("🏡 Cockpit — Mandataire Immobilier Virtuel (100% Live)")
-api_badge = "🟢 Clé Gemini configurée" if st.session_state["gemini_api_key"] else "⚪ Mode Local (Clé Gemini non renseignée)"
+has_key = bool(st.session_state["gemini_api_key"])
+api_badge = "🟢 Clé Gemini active" if has_key else "⚪ Mode Local (Clé Gemini non renseignée)"
 st.markdown(
     f"**{api_badge}** | "
     f"💰 Budget max : **{current_criteria['max_budget']:,} €** | "
