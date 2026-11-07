@@ -1,6 +1,7 @@
 import hashlib
 import os
 from pathlib import Path
+from typing import Any, Dict
 import streamlit as st
 from dotenv import load_dotenv, set_key
 
@@ -15,7 +16,7 @@ from database import (
     update_listing_analysis,
     upsert_listing,
 )
-from ai_analyzer import analyze_listing, test_gemini_api_key
+from ai_analyzer import analyze_listing, analyze_listings_parallel, test_gemini_api_key
 from scraper import (
     CITY_METADATA,
     build_portal_search_links,
@@ -43,7 +44,7 @@ if "analysis_running" not in st.session_state:
 if "analysis_paused" not in st.session_state:
     st.session_state["analysis_paused"] = False
 
-# --- BARRE LATÉRALE : CLÉ API GEMINI (AVEC BOUTON TEST) & CRITÈRES DE RECHERCHE ---
+# --- BARRE LATÉRALE : CLÉ API GEMINI (AVEC BOUTON TEST), PARALLÉLISME & CRITÈRES DE RECHERCHE ---
 with st.sidebar:
     st.title("🤖 Moteur IA (Gemini)")
     api_key_input = st.text_input(
@@ -76,6 +77,14 @@ with st.sidebar:
             st.success(f"✅ {test_res['message']}")
         else:
             st.error(f"❌ {test_res['message']}")
+
+    max_workers = st.slider(
+        "⚡ Vitesse de tri (threads parallèles)",
+        min_value=1,
+        max_value=8,
+        value=4,
+        help="Nombre d'analyses IA menées simultanément pour accélérer le tri sans saturer l'API.",
+    )
 
     st.divider()
     st.title("⚙️ Critères de Recherche")
@@ -228,7 +237,7 @@ if launch_search:
             label=(
                 f"📥 Collecte terminée : {stats['total']} annonces récupérées "
                 f"({stats.get('seloger', 0)} SeLoger, {stats['bienici_agences']} Bien'ici, {stats['orpi_direct']} Orpi) — "
-                f"{new_count} nouvelles en base. Démarrage du tri IA sur {len(pending_after_scrape)} annonces..."
+                f"{new_count} nouvelles en base. Démarrage du tri parallèle sur {len(pending_after_scrape)} annonces..."
             ),
             state="complete",
             expanded=False,
@@ -236,34 +245,56 @@ if launch_search:
     st.session_state["analysis_running"] = True
 
 
-# --- ACTION 2 : EXÉCUTION DE L'ANALYSE IA (INTERRUPTABLE SANS PERTE DE BDD) ---
+# --- ACTION 2 : EXÉCUTION DE L'ANALYSE IA EN PARALLÈLE (INTERRUPTABLE SANS PERTE DE BDD) ---
 if st.session_state.get("analysis_running") and not st.session_state.get("analysis_paused"):
     pending = get_pending_listings()
     if pending:
         active_key = st.session_state["gemini_api_key"]
         engine_label = "API Gemini (gemini-3.8-flash)" if active_key else "Moteur de règles local (sans clé API)"
+        total_to_process = len(pending)
 
         info_col, stop_inline_col = st.columns([4, 1])
         with info_col:
-            progress_bar = st.progress(0, text=f"🧠 Analyse IA ({engine_label}) : 0 / {len(pending)} annonces en attente...")
+            progress_bar = st.progress(
+                0,
+                text=f"🧠 Analyse IA parallèle ({max_workers} threads | {engine_label}) : 0 / {total_to_process} annonces...",
+            )
         with stop_inline_col:
             if st.button("⏹️ Interrompre l'analyse IA", type="secondary", use_container_width=True):
                 st.session_state["analysis_running"] = False
                 st.session_state["analysis_paused"] = True
                 st.rerun()
 
-        total_to_process = len(pending)
-        for idx, item in enumerate(pending):
-            # Chaque annonce est sauvegardée immédiatement en base SQLite (commit atomique)
-            analysis = analyze_listing(item, current_criteria, api_key=active_key)
+        completed_counter = [0]
+
+        def on_item_completed(item: Dict[str, Any], analysis: Dict[str, Any], count: int, total: int) -> None:
+            # Chaque annonce terminée est sauvegardée immédiatement en base SQLite (commit atomique)
             update_listing_analysis(item["id"], analysis)
+            completed_counter[0] = count
             progress_bar.progress(
-                (idx + 1) / max(1, total_to_process),
-                text=f"🧠 Analyse IA ({engine_label}) : {idx + 1} / {total_to_process} — {item['city']} ({item['price']:,} €)".replace(",", " "),
+                count / max(1, total),
+                text=(
+                    f"🧠 Analyse IA parallèle ({max_workers} threads | {engine_label}) : {count} / {total} — "
+                    f"{item.get('city', '')} ({item.get('price', 0):,} €)".replace(",", " ")
+                ),
             )
 
+        def check_cancelled() -> bool:
+            return bool(st.session_state.get("analysis_paused"))
+
+        analyze_listings_parallel(
+            listings=pending,
+            criteria=current_criteria,
+            api_key=active_key,
+            model_name="gemini-3.8-flash",
+            max_workers=max_workers,
+            on_completed=on_item_completed,
+            check_cancelled=check_cancelled,
+        )
+
         st.session_state["analysis_running"] = False
-        st.success(f"✅ Tri IA terminé avec succès ({total_to_process} annonces analysées et enregistrées) !")
+        st.success(f"✅ Tri IA terminé avec succès ({completed_counter[0]} annonces analysées et enregistrées) !")
+        st.rerun()
     else:
         st.session_state["analysis_running"] = False
 

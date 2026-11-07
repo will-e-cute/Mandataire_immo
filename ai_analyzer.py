@@ -1,9 +1,11 @@
+import concurrent.futures
 import json
 import os
 import re
 import time
+import unicodedata
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 import httpx
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -69,10 +71,14 @@ def build_system_prompt(criteria: Dict[str, Any]) -> str:
 
 
 def _normalize_city(text: str) -> str:
-    text = text.lower().strip()
-    text = re.sub(r"[-'’œ]", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.replace("oe", "o")
+    if not text:
+        return ""
+    text = str(text).lower().strip()
+    text = text.replace("œ", "oe").replace("æ", "ae")
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = re.sub(r"[-'’_./]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def heuristic_analyze_listing(listing: Dict[str, Any], criteria: Dict[str, Any]) -> Dict[str, Any]:
@@ -246,7 +252,7 @@ def test_gemini_api_key(api_key: Optional[str] = None, model_name: str = "gemini
     Teste instantanément (< 300 ms) la validité de la clé API Gemini auprès des serveurs Google
     sans retry bloquant ni erreur de certificat SSL local Windows.
     """
-    effective_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
+    effective_key = (os.getenv("GEMINI_API_KEY") if api_key is None else api_key).strip()
     if not effective_key:
         return {
             "ok": False,
@@ -288,6 +294,43 @@ def test_gemini_api_key(api_key: Optional[str] = None, model_name: str = "gemini
         }
 
 
+def call_gemini_interactions_api(
+    user_prompt: str,
+    system_instruction: str,
+    api_key: str,
+    model_name: str = "gemini-3.8-flash",
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    """
+    Appelle directement l'API REST Interactions v1beta de Google Gemini avec sortie JSON structurée Pydantic.
+    Garantit une exécution rapide (< 1.5s) sans blocage SSL sur l'environnement Windows local.
+    """
+    url = f"https://generativelanguage.googleapis.com/v1beta/interactions?key={api_key}"
+    payload = {
+        "model": model_name,
+        "system_instruction": system_instruction,
+        "input": user_prompt,
+        "response_format": {
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": ListingAnalysisSchema.model_json_schema(),
+        },
+    }
+    with httpx.Client(verify=False, timeout=timeout) as client:
+        resp = client.post(url, json=payload)
+        if resp.status_code == 200:
+            data = resp.json()
+            output_text = data.get("output_text") or "{}"
+            parsed = ListingAnalysisSchema.model_validate_json(output_text)
+            res = parsed.model_dump()
+            res["moteur"] = f"Gemini ({model_name})"
+            return res
+        elif resp.status_code == 429:
+            raise RuntimeError("RESOURCE_EXHAUSTED: Quota Gemini dépassé (429)")
+        else:
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+
+
 def analyze_listing(
     listing: Dict[str, Any],
     criteria: Dict[str, Any],
@@ -295,13 +338,11 @@ def analyze_listing(
     model_name: str = "gemini-3.8-flash",
 ) -> Dict[str, Any]:
     """
-    Analyse une annonce immobilière via l'API Gemini (google-genai SDK >= 2.30.1 avec Interactions API
-    et schéma JSON strict) ou bascule proprement sur le moteur d'analyse déterministe si la clé API
-    n'est pas renseignée.
+    Analyse une annonce immobilière via l'API Gemini ou bascule sur le moteur
+    d'analyse déterministe si la clé est absente ou si le quota est dépassé.
     """
-    effective_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
+    effective_key = (os.getenv("GEMINI_API_KEY") if api_key is None else api_key).strip()
 
-    # Si aucune clé API Gemini n'est disponible, utiliser le moteur expert local sans erreur
     if not effective_key:
         return heuristic_analyze_listing(listing, criteria)
 
@@ -324,27 +365,83 @@ def analyze_listing(
     )
 
     try:
-        from google import genai
-        from google.genai import types
-
-        http_opts = types.HttpOptions(httpx_client=httpx.Client(verify=False, timeout=20.0))
-        client = genai.Client(api_key=effective_key, http_options=http_opts)
-        interaction = client.interactions.create(
-            model=model_name,
+        return call_gemini_interactions_api(
+            user_prompt=user_prompt,
             system_instruction=system_instruction,
-            input=user_prompt,
-            response_format={
-                "type": "text",
-                "mime_type": "application/json",
-                "schema": ListingAnalysisSchema.model_json_schema(),
-            },
+            api_key=effective_key,
+            model_name=model_name,
         )
-        parsed = ListingAnalysisSchema.model_validate_json(interaction.output_text)
-        result = parsed.model_dump()
-        result["moteur"] = f"Gemini ({model_name})"
-        return result
     except Exception as exc:
-        # En cas d'erreur réseau/quota, on sécurise avec le moteur local + note
+        err_str = str(exc)
+        if "RESOURCE_EXHAUSTED" in err_str or "429" in err_str:
+            reason = "Quota Gemini dépassé (429)"
+        else:
+            reason = f"Erreur API ({type(exc).__name__})"
+
         fallback = heuristic_analyze_listing(listing, criteria)
-        fallback["moteur"] = f"Fallback Local (Erreur API: {type(exc).__name__})"
+        fallback["moteur"] = f"Fallback Local ({reason})"
         return fallback
+
+
+def analyze_listings_parallel(
+    listings: List[Dict[str, Any]],
+    criteria: Dict[str, Any],
+    api_key: Optional[str] = None,
+    model_name: str = "gemini-3.8-flash",
+    max_workers: int = 4,
+    on_completed: Optional[Callable[[Dict[str, Any], Dict[str, Any], int, int], None]] = None,
+    check_cancelled: Optional[Callable[[], bool]] = None,
+) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    """
+    Exécute l'analyse d'un lot d'annonces en parallèle à l'aide d'un ThreadPoolExecutor.
+    Pour chaque annonce terminée, invoque on_completed(listing, analysis, completed_count, total).
+    Interrompt proprement l'exécution si check_cancelled() retourne True.
+    Court-circuite les appels suivants en mode local dès détection de l'épuisement du quota Gemini.
+    """
+    results: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    total = len(listings)
+    if total == 0:
+        return results
+
+    workers = max(1, min(max_workers, 8))
+    quota_exhausted = [False]
+
+    def _worker_task(item: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        if quota_exhausted[0]:
+            analysis = heuristic_analyze_listing(item, criteria)
+            analysis["moteur"] = "Fallback Local (Quota Gemini dépassé)"
+            return item, analysis
+
+        analysis = analyze_listing(item, criteria, api_key=api_key, model_name=model_name)
+        if "Quota Gemini dépassé" in analysis.get("moteur", ""):
+            quota_exhausted[0] = True
+        return item, analysis
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_item = {
+            executor.submit(_worker_task, item): item
+            for item in listings
+        }
+        completed_count = 0
+        for future in concurrent.futures.as_completed(future_to_item):
+            if check_cancelled and check_cancelled():
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+
+            orig_item = future_to_item[future]
+            try:
+                item, analysis = future.result()
+            except Exception as exc:
+                item = orig_item
+                analysis = heuristic_analyze_listing(item, criteria)
+                analysis["moteur"] = f"Fallback Local (Exception thread: {exc})"
+
+            results.append((item, analysis))
+            completed_count += 1
+            if on_completed:
+                try:
+                    on_completed(item, analysis, completed_count, total)
+                except Exception:
+                    pass
+
+    return results
