@@ -11,6 +11,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# IDE
+.idea/
+.vscode/
+
 # Base de données locale SQLite (optionnel : décommenter si vous ne souhaitez pas versionner mandataire.db)
 *.db-journal
 *.db-wal

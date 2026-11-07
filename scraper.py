@@ -1,6 +1,8 @@
 import hashlib
 import json
+import random
 import re
+import time
 import unicodedata
 import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
@@ -142,14 +144,31 @@ CITY_METADATA: Dict[str, Dict[str, str]] = {
     },
 }
 
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/html, */*",
-    "Accept-Language": "fr-FR,fr;q=0.9",
-}
+ROTATING_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+]
+
+
+def get_browser_headers(accept_json: bool = False) -> Dict[str, str]:
+    """
+    Génère des en-têtes HTTP cohérents sans forcer Brotli ('br') afin que httpx
+    décompresse nativement les réponses gzip/deflate de SeLoger, Orpi et Bien'ici.
+    """
+    ua = random.choice(ROTATING_USER_AGENTS)
+    headers = {
+        "User-Agent": ua,
+        "Accept-Language": "fr-FR,fr;q=0.9",
+    }
+    if accept_json:
+        headers["Accept"] = "application/json, text/plain, */*"
+    else:
+        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    return headers
+
+
+DEFAULT_HEADERS = get_browser_headers(accept_json=False)
 
 PARKING_KEYWORDS = [
     "garage",
@@ -181,14 +200,6 @@ def _detect_parking_in_text(text: str, explicit_flag: Optional[bool] = None) -> 
     return any(kw in text_lower for kw in PARKING_KEYWORDS)
 
 
-def _clean_html_text(raw_html: str) -> str:
-    if not raw_html:
-        return ""
-    text = re.sub(r"<br\s*/?>", "\n", raw_html, flags=re.IGNORECASE)
-    text = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
-    return re.sub(r"\s+", " ", text).strip()
-
-
 def _get_city_meta(city_name: str) -> Dict[str, str]:
     c_norm = _normalize_city(city_name)
     for known_city, meta in CITY_METADATA.items():
@@ -200,6 +211,75 @@ def _get_city_meta(city_name: str) -> Dict[str, str]:
         "slug": f"{slug}-59000",
         "orpi_slug": slug,
     }
+
+
+def robust_http_get(
+    client: httpx.Client,
+    url: str,
+    max_retries: int = 2,
+    backoff: float = 1.0,
+) -> Optional[httpx.Response]:
+    """Exécute une requête GET avec retry et backoff exponentiel pour absorber les micro-coupures et rate limits."""
+    for attempt in range(max_retries + 1):
+        try:
+            resp = client.get(url)
+            if resp.status_code in (429, 500, 502, 503, 504):
+                if attempt < max_retries:
+                    time.sleep(backoff * (attempt + 1))
+                    continue
+            return resp
+        except (httpx.TimeoutException, httpx.NetworkError):
+            if attempt < max_retries:
+                time.sleep(backoff * (attempt + 1))
+                continue
+            return None
+        except Exception:
+            return None
+    return None
+
+
+def fetch_page_content_playwright(url: str, timeout: float = 16.0) -> Optional[str]:
+    """
+    Fallback anti-WAF / anti-bot : utilise un vrai navigateur Chromium headless via Playwright
+    pour contourner les challenges JS / Captcha DataDome / Cloudflare si la requête HTTP simple est bloquée.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except (ImportError, ModuleNotFoundError):
+        return None
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                viewport={"width": 1366, "height": 768},
+                locale="fr-FR",
+            )
+            page = context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+            page.wait_for_timeout(1200)
+            html = page.content()
+            browser.close()
+            return html
+    except Exception as exc:
+        print(f"[Playwright Fallback] Échec navigation pour {url}: {exc}")
+        return None
+
+
+def _clean_html_text(raw_html: str) -> str:
+    if not raw_html:
+        return ""
+    text = re.sub(r"<br\s*/?>", "\n", raw_html, flags=re.IGNORECASE)
+    text = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _format_agency_source(ad_id: str, account_name: str = "") -> str:
@@ -233,8 +313,8 @@ def resolve_bienici_zone_id(client: httpx.Client, city_name: str) -> List[str]:
 
     try:
         url = f"https://www.bienici.com/place.json?q={urllib.parse.quote(city_name)}"
-        resp = client.get(url)
-        if resp.status_code == 200:
+        resp = robust_http_get(client, url, max_retries=1)
+        if resp and resp.status_code == 200:
             data = resp.json()
             zids = data.get("zoneIds", [])
             if zids:
@@ -264,7 +344,8 @@ def scrape_bienici_live(criteria: Dict[str, Any], limit_per_city: int = 15, time
     if not prop_types_map:
         prop_types_map = ["house", "flat"]
 
-    with httpx.Client(headers=DEFAULT_HEADERS, timeout=timeout, follow_redirects=True, verify=False) as client:
+    headers = get_browser_headers(accept_json=True)
+    with httpx.Client(headers=headers, timeout=timeout, follow_redirects=True, verify=False) as client:
         for city in cities:
             zone_ids = resolve_bienici_zone_id(client, city)
             if not zone_ids:
@@ -276,7 +357,7 @@ def scrape_bienici_live(criteria: Dict[str, Any], limit_per_city: int = 15, time
                 "showAllModels": False,
                 "filterType": "buy",
                 "propertyType": prop_types_map,
-                "minPrice": 70000,  # Évite les parkings seuls ou erreurs de saisie à 1€
+                "minPrice": 70000,
                 "maxPrice": max_budget,
                 "minArea": min_surface,
                 "sortBy": "publicationDate",
@@ -285,10 +366,21 @@ def scrape_bienici_live(criteria: Dict[str, Any], limit_per_city: int = 15, time
             }
             url = "https://www.bienici.com/realEstateAds.json?filters=" + urllib.parse.quote(json.dumps(filters))
             try:
-                resp = client.get(url)
-                if resp.status_code != 200:
+                resp = robust_http_get(client, url, max_retries=2)
+                data = None
+                if resp and resp.status_code == 200:
+                    data = resp.json()
+                elif not resp or resp.status_code in (403, 429):
+                    pw_html = fetch_page_content_playwright(url, timeout=timeout)
+                    if pw_html:
+                        soup = BeautifulSoup(pw_html, "html.parser")
+                        pre = soup.find("pre")
+                        if pre and pre.text:
+                            data = json.loads(pre.text)
+
+                if not data:
                     continue
-                data = resp.json()
+
                 for ad in data.get("realEstateAds", []):
                     ad_id = str(ad.get("id", "")).strip()
                     if not ad_id or ad_id in seen_ids:
@@ -313,7 +405,6 @@ def scrape_bienici_live(criteria: Dict[str, Any], limit_per_city: int = 15, time
 
                     raw_desc = _clean_html_text(ad.get("description") or "")
 
-                    # Enrichissement de la description avec les métadonnées techniques Bien'ici
                     extra_meta = []
                     if ad.get("bedroomsQuantity"):
                         extra_meta.append(f"{ad.get('bedroomsQuantity')} chambres")
@@ -341,7 +432,6 @@ def scrape_bienici_live(criteria: Dict[str, Any], limit_per_city: int = 15, time
                         district = f" ({raw_dist.strip()})" if isinstance(raw_dist, str) and raw_dist.strip() else ""
                         title = f"{prop_type} {rooms} pièces {surface:g} m² - {ad_city}{district}"
 
-                    # Détection parking via booléen JSON + texte
                     has_parking_json = bool(
                         ad.get("hasParking") or ad.get("hasGarage") or (ad.get("parkingPlacesQuantity") or 0) > 0
                     )
@@ -393,26 +483,23 @@ def _fetch_orpi_detail_enrichment(
     dpe_num_map = {"1": "A", "2": "B", "3": "C", "4": "D", "5": "E", "6": "F", "7": "G"}
 
     try:
-        resp = client.get(ad_url)
-        if resp.status_code != 200:
+        resp = robust_http_get(client, ad_url, max_retries=1)
+        if not resp or resp.status_code != 200:
             return full_desc, dpe, postal_code, has_parking_dl
 
         html = resp.text
         soup = BeautifulSoup(html, "html.parser")
 
-        # 1. Description complète dans div.s-cms ("L'avis de l'agent")
         cms_div = soup.find("div", class_=re.compile(r"\bs-cms\b"))
         if cms_div:
             full_desc = _clean_html_text(str(cms_div))
 
-        # 2. Extraction DPE depuis l'élément actif du graphe DPE
         active_dpe = soup.find("li", class_=re.compile(r"c-dpe__index--active"))
         if active_dpe:
             txt = active_dpe.get_text(" ", strip=True)
             if txt and txt[0].upper() in ("A", "B", "C", "D", "E", "F", "G"):
                 dpe = txt[0].upper()
 
-        # 3. Extraction depuis window.dataLayer (dpe, codePostal, nbGarage, nbParking, stationnement)
         m_cp = re.search(r'codePostal\s*:\s*["\'](\d{5})["\']', html)
         if m_cp:
             postal_code = m_cp.group(1)
@@ -456,7 +543,8 @@ def scrape_orpi_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List[Di
         type_params.append(f"realEstateTypes[{len(type_params)}]=appartement")
     type_query = ("&" + "&".join(type_params)) if type_params else ""
 
-    with httpx.Client(headers=DEFAULT_HEADERS, timeout=timeout, follow_redirects=True, verify=False) as client:
+    headers = get_browser_headers(accept_json=False)
+    with httpx.Client(headers=headers, timeout=timeout, follow_redirects=True, verify=False) as client:
         for city in cities:
             meta = _get_city_meta(city)
             orpi_slug = meta.get("orpi_slug") or _normalize_city(city).replace(" ", "-")
@@ -465,16 +553,22 @@ def scrape_orpi_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List[Di
                 f"{type_query}&maxPrice={max_budget}&minSurface={int(min_surface)}"
             )
             try:
-                resp = client.get(url)
-                if resp.status_code != 200:
+                resp = robust_http_get(client, url, max_retries=1)
+                html_text = ""
+                if resp and resp.status_code == 200:
+                    html_text = resp.text
+                elif not resp or resp.status_code in (403, 429):
+                    html_text = fetch_page_content_playwright(url, timeout=timeout) or ""
+
+                if not html_text:
                     continue
-                soup = BeautifulSoup(resp.text, "html.parser")
+
+                soup = BeautifulSoup(html_text, "html.parser")
                 div = soup.find("div", attrs={"data-result": True})
                 if not div:
                     continue
                 payload = json.loads(div["data-result"])
 
-                # Combine items + similars (au cas où Orpi place des biens des autres communes ciblées dans similars)
                 candidates = list(payload.get("items") or []) + list(payload.get("similars") or [])
                 for item in candidates:
                     slug = item.get("slug")
@@ -492,7 +586,6 @@ def scrape_orpi_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List[Di
                     if price < 70000 or price > max_budget or surface < min_surface:
                         continue
 
-                    # Extraction propre de la ville et du quartier (qui sont des dicts dans le JSON Orpi)
                     raw_city = item.get("city")
                     if isinstance(raw_city, dict):
                         ad_city = str(raw_city.get("name") or city).strip()
@@ -526,7 +619,6 @@ def scrape_orpi_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List[Di
                     if tags:
                         full_desc += f" [Tags Orpi : {', '.join(tags)}]"
 
-                    # Détection DPE (JSON item -> fiche détail -> regex texte)
                     raw_item_dpe = str(item.get("dpe") or "").strip().upper()
                     if raw_item_dpe in ("A", "B", "C", "D", "E", "F", "G"):
                         dpe = raw_item_dpe
@@ -584,8 +676,9 @@ def resolve_seloger_place_id(client: httpx.Client, city_name: str) -> str:
 
     slug = c_norm.replace(" ", "-")
     try:
-        resp = client.get(f"https://www.seloger.com/immobilier/achat/immo-{slug}-59/")
-        if resp.status_code == 200:
+        url = f"https://www.seloger.com/immobilier/achat/immo-{slug}-59/"
+        resp = robust_http_get(client, url, max_retries=1)
+        if resp and resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
             for s in soup.find_all("script"):
                 txt = s.string or ""
@@ -609,9 +702,9 @@ def resolve_seloger_place_id(client: httpx.Client, city_name: str) -> str:
 def scrape_seloger_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List[Dict[str, Any]]:
     """
     Scrape en temps réel les annonces SeLoger.com (via le flux SSR __UFRN_FETCHER__
-    de /classified-search) pour les villes, budget et surface sélectionnés.
-    Extrait le DPE officiel (`energyClass`), filtre les annonces suggérées hors-secteur
-    et enrichit les caractéristiques techniques.
+    de /classified-search) pour les villes, budget et surface sélectionnés,
+    avec extraction du DPE officiel (`energyClass`), filtrage des suggestions hors-secteur
+    et bascule automatique Playwright en cas de défi anti-bot / DataDome.
     """
     results: List[Dict[str, Any]] = []
     seen_ids = set()
@@ -628,10 +721,7 @@ def scrape_seloger_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List
     if not estate_types:
         estate_types = ["House", "Apartment"]
 
-    seloger_headers = {
-        **DEFAULT_HEADERS,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
+    seloger_headers = get_browser_headers(accept_json=False)
 
     with httpx.Client(headers=seloger_headers, timeout=timeout, follow_redirects=True, verify=False) as client:
         for city in cities:
@@ -645,19 +735,36 @@ def scrape_seloger_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List
                 f"&locations={place_id}&priceMin=70000&priceMax={max_budget}&spaceMin={int(min_surface)}"
             )
             try:
-                resp = client.get(url)
-                if resp.status_code != 200:
+                resp = robust_http_get(client, url, max_retries=1)
+                html_text = ""
+                used_playwright = False
+                if resp and resp.status_code == 200:
+                    html_text = resp.text
+                elif not resp or resp.status_code in (403, 429):
+                    html_text = fetch_page_content_playwright(url, timeout=timeout) or ""
+                    used_playwright = True
+
+                if not html_text:
                     continue
-                soup = BeautifulSoup(resp.text, "html.parser")
+
+                soup = BeautifulSoup(html_text, "html.parser")
+
                 for s in soup.find_all("script"):
                     txt = s.string or ""
                     if "__UFRN_FETCHER__" not in txt:
                         continue
-                    start = txt.find("JSON.parse(") + len("JSON.parse(")
-                    end = txt.rfind(")")
-                    data = json.loads(json.loads(txt[start:end]))
-                    serp = data.get("data", {}).get("classified-serp-data", {})
-                    cdata = serp.get("classifiedsData", {})
+                    try:
+                        start = txt.find("JSON.parse(") + len("JSON.parse(")
+                        end = txt.rfind(")")
+                        data = json.loads(json.loads(txt[start:end]))
+                        serp = data.get("data", {}).get("classified-serp-data", {})
+                        cdata = serp.get("classifiedsData", {})
+                    except Exception:
+                        continue
+
+                    if not cdata:
+                        continue
+
                     enriched_meta = serp.get("enrichedClassifiedsData", {})
                     suggested_ids = set(str(x) for x in (serp.get("suggestedClassifieds") or []))
 
@@ -666,7 +773,6 @@ def scrape_seloger_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List
                         if not ad_id_str or ad_id_str in seen_ids:
                             continue
 
-                        # Écarte les suggestions hors-commune injectées par SeLoger si la ville ne correspond pas
                         is_suggestion = (
                             ad_id_str in suggested_ids
                             or bool((enriched_meta.get(ad_id_str) or {}).get("isSuggestion"))
@@ -746,10 +852,14 @@ def scrape_seloger_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List
                         if ad_url.startswith("/"):
                             ad_url = "https://www.seloger.com" + ad_url
 
+                        src_tag = f"SeLoger ({agency_title})"
+                        if used_playwright:
+                            src_tag += " [Playwright]"
+
                         results.append(
                             {
                                 "external_id": f"seloger-{ad_id_str}",
-                                "source": f"SeLoger ({agency_title})",
+                                "source": src_tag,
                                 "url": ad_url,
                                 "title": full_title,
                                 "property_type": prop_type,
@@ -772,7 +882,7 @@ def scrape_seloger_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List
 def scrape_all_live_sources(criteria: Dict[str, Any]) -> Dict[str, Any]:
     """
     Exécute le scraping live multi-sources (SeLoger + Bien'ici + Réseaux d'Agences & Orpi)
-    sans aucune annonce de démo.
+    avec résilience réseau et bypass WAF automatique.
     """
     seloger_ads = scrape_seloger_live(criteria)
     bienici_ads = scrape_bienici_live(criteria, limit_per_city=15)

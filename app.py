@@ -1,19 +1,31 @@
 import hashlib
+import io
 import os
+import re
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
+import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv, set_key
 
 from database import (
     delete_all_listings,
+    delete_listing_permanently,
+    empty_quarantine,
     get_all_listings,
     get_criteria,
     get_pending_listings,
+    get_quarantined_listings,
+    get_selected_listings,
     init_db,
     reset_all_listings_to_pending,
+    restore_all_quarantine,
     save_criteria,
+    set_listing_quarantine,
+    set_listing_selection,
     update_listing_analysis,
+    update_listing_followup,
     upsert_listing,
 )
 from ai_analyzer import analyze_listing, analyze_listings_parallel, test_gemini_api_key
@@ -33,7 +45,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Initialisation de la base SQLite locale
+# Initialisation de la base SQLite locale et migration automatique du schéma
 init_db()
 current_criteria = get_criteria()
 
@@ -44,7 +56,96 @@ if "analysis_running" not in st.session_state:
 if "analysis_paused" not in st.session_state:
     st.session_state["analysis_paused"] = False
 
-# --- BARRE LATÉRALE : CLÉ API GEMINI (AVEC BOUTON TEST), PARALLÉLISME & CRITÈRES DE RECHERCHE ---
+
+def extract_phone_number(text: str) -> str:
+    """Extrait le premier numéro de téléphone français valide trouvé dans une description."""
+    if not text:
+        return ""
+    pattern = r"(?:(?:\+|00)33\s?[1-9]|0[1-9])(?:[\s.-]?\d{2}){4}"
+    match = re.search(pattern, text)
+    if match:
+        clean = match.group(0).strip()
+        digits = re.sub(r"\D", "", clean)
+        if len(digits) == 10 and digits.startswith("0"):
+            return f"{digits[0:2]} {digits[2:4]} {digits[4:6]} {digits[6:8]} {digits[8:10]}"
+        return clean
+    return ""
+
+
+def extract_default_agency_name(source: str) -> str:
+    """Extrait un nom d'agence lisible par défaut à partir du libellé source."""
+    if not source:
+        return ""
+    if "/" in source:
+        parts = source.split("/", 1)
+        cleaned = re.sub(r"\(via.*?\)", "", parts[1]).strip()
+        return cleaned or source
+    cleaned = re.sub(r"\(via.*?\)", "", source).strip()
+    if "Agrégateur" in cleaned or "Agregateur" in cleaned or "Manuel" in cleaned:
+        return ""
+    return cleaned
+
+
+def generate_export_files(listings_to_export: List[Dict[str, Any]]) -> Tuple[bytes, bytes]:
+    """Génère les exports binaires CSV (séparateur point-virgule Excel FR) et Excel (.xlsx)."""
+    rows = []
+    for l in listings_to_export:
+        status_fr = {
+            "a_visiter": "🟢 À visiter (Opportunité)",
+            "a_verifier": "🟡 À vérifier (À confirmer)",
+            "pending_analysis": "⏳ En attente",
+            "rejete": "🔴 Rejeté (Critères No-Go)",
+        }.get(l.get("status"), l.get("status"))
+
+        pros = l.get("ai_pros") or []
+        cons = l.get("ai_cons") or []
+        signals = l.get("ai_signals") or []
+
+        rows.append(
+            {
+                "Sélectionné": "⭐ Oui" if l.get("is_selected") else "Non",
+                "Contact Agence": "✅ Oui" if l.get("contact_made") else "❌ Non",
+                "Visite Programmée": "🗓️ Oui" if l.get("visit_scheduled") else "❌ Non",
+                "Nom Agence": l.get("agency_name") or "",
+                "Téléphone Agence": l.get("agency_phone") or "",
+                "Notes Suivi": l.get("followup_notes") or "",
+                "Statut IA": status_fr,
+                "Score IA (/10)": l.get("ai_score"),
+                "Titre": l.get("title"),
+                "Ville": l.get("city"),
+                "Code Postal": l.get("postal_code"),
+                "Prix (€)": l.get("price"),
+                "Surface (m²)": l.get("surface"),
+                "Prix/m² (€/m²)": l.get("price_per_m2"),
+                "Pièces": l.get("rooms"),
+                "DPE": l.get("dpe"),
+                "Parking / Garage": "Oui" if l.get("has_parking") else "Non",
+                "Source": l.get("source"),
+                "URL Annonce": l.get("url"),
+                "Synthèse IA": l.get("ai_summary") or "",
+                "Motif de rejet": l.get("ai_rejection_reason") or "",
+                "Points forts": " | ".join(pros) if isinstance(pros, list) else str(pros),
+                "Points de vigilance": " | ".join(cons) if isinstance(cons, list) else str(cons),
+                "Signaux faibles": " | ".join(signals) if isinstance(signals, list) else str(signals),
+                "Date Scraping": l.get("scraped_at"),
+                "Date Analyse": l.get("analyzed_at"),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    # CSV formaté pour Excel France (point-virgule et encodage UTF-8 avec BOM)
+    csv_bytes = df.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
+
+    # Excel natif (.xlsx)
+    excel_buffer = io.BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Opportunités Immo")
+    excel_bytes = excel_buffer.getvalue()
+
+    return csv_bytes, excel_bytes
+
+
+# --- BARRE LATÉRALE : CLÉ API GEMINI, PARALLÉLISME & CRITÈRES DE RECHERCHE ---
 with st.sidebar:
     st.title("🤖 Moteur IA (Gemini)")
     api_key_input = st.text_input(
@@ -83,7 +184,7 @@ with st.sidebar:
         min_value=1,
         max_value=8,
         value=4,
-        help="Nombre d'analyses IA menées simultanément pour accélérer le tri sans saturer l'API.",
+        help="Nombre d'analyses menées simultanément pour accélérer le tri sans saturer l'API.",
     )
 
     st.divider()
@@ -197,7 +298,7 @@ with st.sidebar:
         st.rerun()
 
 
-# --- ACTION 1 : LANCEMENT DU SCRAPING LIVE ---
+# --- ACTION 1 : LANCEMENT DU SCRAPING LIVE AVEC RÉSILIENCE WAF ---
 if launch_search:
     st.session_state["analysis_paused"] = False
     parsed_cities = [c.strip() for c in cities_text.split(",") if c.strip()]
@@ -215,10 +316,10 @@ if launch_search:
     )
     current_criteria = get_criteria()
 
-    with st.status("🔍 Collecte Live (SeLoger + Bien'ici + Agences & Orpi)...", expanded=True) as status_box:
+    with st.status("🔍 Collecte Live (SeLoger + Bien'ici + Agences & Orpi + Fallback Playwright)...", expanded=True) as status_box:
         st.write(
             f"1️⃣ Interrogation en direct de **SeLoger.com**, **Bien'ici** (IAD, Safti, Citya, Square Habitat, Guy Hoquet, ERA, Sergic...) "
-            f"et **Orpi** sur : **{', '.join(parsed_cities)}**..."
+            f"et **Orpi** sur : **{', '.join(parsed_cities)}** (avec protection anti-WAF active)..."
         )
         scrape_report = scrape_all_live_sources(current_criteria)
         all_fetched = scrape_report["ads"]
@@ -245,7 +346,7 @@ if launch_search:
     st.session_state["analysis_running"] = True
 
 
-# --- ACTION 2 : EXÉCUTION DE L'ANALYSE IA EN PARALLÈLE (INTERRUPTABLE SANS PERTE DE BDD) ---
+# --- ACTION 2 : EXÉCUTION DE L'ANALYSE IA EN PARALLÈLE ---
 if st.session_state.get("analysis_running") and not st.session_state.get("analysis_paused"):
     pending = get_pending_listings()
     if pending:
@@ -267,14 +368,13 @@ if st.session_state.get("analysis_running") and not st.session_state.get("analys
 
         completed_counter = [0]
 
-        def on_item_completed(item: Dict[str, Any], analysis: Dict[str, Any], count: int, total: int) -> None:
-            # Chaque annonce terminée est sauvegardée immédiatement en base SQLite (commit atomique)
+        def on_item_completed(item: Dict[str, Any], analysis: Dict[str, Any], count: int, total: int):
             update_listing_analysis(item["id"], analysis)
             completed_counter[0] = count
             progress_bar.progress(
                 count / max(1, total),
                 text=(
-                    f"🧠 Analyse IA parallèle ({max_workers} threads | {engine_label}) : {count} / {total} — "
+                    f"🧠 Analyse IA parallèle ({max_workers} threads) : {count} / {total} — "
                     f"{item.get('city', '')} ({item.get('price', 0):,} €)".replace(",", " ")
                 ),
             )
@@ -306,6 +406,11 @@ if st.session_state.get("analysis_paused"):
     )
 
 
+# --- CHARGEMENT DES ANNONCES PAR CATÉGORIE ---
+all_active_listings = get_all_listings(include_quarantined=False)
+selected_listings = get_selected_listings()
+quarantined_listings = get_quarantined_listings()
+
 # --- EN-TÊTE DU COCKPIT ---
 st.title("🏡 Cockpit — Mandataire Immobilier Virtuel (100% Live)")
 api_badge = "🟢 Clé Gemini configurée" if st.session_state["gemini_api_key"] else "⚪ Mode Local (Clé Gemini non renseignée)"
@@ -318,44 +423,52 @@ st.markdown(
     f"🚗 Parking/Garage : **{'Obligatoire' if current_criteria['require_parking'] else 'Optionnel'}**".replace(",", " ")
 )
 
-all_listings = get_all_listings()
-
-if not all_listings:
-    st.info(
-        "👋 Aucune annonce en base. Cliquez sur **🚀 Lancer la recherche (Live Scraping)** dans le panneau de gauche pour extraire les vraies annonces en direct depuis Bien'ici et les réseaux d'agences !"
-    )
-
 # --- INDICATEURS CLÉS (KPIs) ---
-a_visiter_list = [x for x in all_listings if x["status"] == "a_visiter"]
-a_verifier_list = [x for x in all_listings if x["status"] == "a_verifier"]
-rejete_list = [x for x in all_listings if x["status"] == "rejete"]
-pending_list = [x for x in all_listings if x["status"] == "pending_analysis"]
+a_visiter_list = [x for x in all_active_listings if x["status"] == "a_visiter"]
+a_verifier_list = [x for x in all_active_listings if x["status"] == "a_verifier"]
+rejete_list = [x for x in all_active_listings if x["status"] == "rejete"]
+pending_list = [x for x in all_active_listings if x["status"] == "pending_analysis"]
 
-col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric("🟢 À Visiter (Validées IA)", len(a_visiter_list))
-col2.metric("🟡 À Vérifier (À confirmer)", len(a_verifier_list))
-col3.metric("🔴 Ignorées / Rejetées (No-Go)", len(rejete_list))
-col4.metric("⏳ En attente d'analyse", len(pending_list))
-if a_visiter_list:
-    avg_m2 = sum(x["price_per_m2"] or 0 for x in a_visiter_list) / len(a_visiter_list)
-    col5.metric("💶 Prix/m² moyen (À visiter)", f"{avg_m2:,.0f} €/m²".replace(",", " "))
-else:
-    col5.metric("💶 Prix/m² moyen (À visiter)", "—")
+col_sel, col1, col2, col3, col4, col5 = st.columns(6)
+col_sel.metric(
+    "⭐ Sélectionnées",
+    len(selected_listings),
+    help="Annonces retenues pour vos contacts et visites programmées",
+)
+col1.metric("🟢 À Visiter (Opportunités)", len(a_visiter_list))
+col2.metric("🟡 À Vérifier", len(a_verifier_list))
+col3.metric("🔴 Rejetées IA (No-Go)", len(rejete_list))
+col4.metric("⏳ En attente", len(pending_list))
+col5.metric(
+    "🗑️ Quarantaine",
+    len(quarantined_listings),
+    help="Annonces supprimées / masquées du flux actif",
+)
 
 st.divider()
 
-# --- ONGLETS DU COCKPIT ---
-tab_cockpit, tab_portails, tab_ajout = st.tabs(
+# --- ONGLETS PRINCIPAUX DU COCKPIT ---
+tab_cockpit, tab_selection, tab_quarantaine, tab_portails, tab_ajout = st.tabs(
     [
-        f"🎯 Annonces Réelles Triées ({len(all_listings)})",
+        f"🎯 Annonces du Marché ({len(all_active_listings)})",
+        f"⭐ Sélectionnées pour Visites ({len(selected_listings)})",
+        f"🗑️ Quarantaine ({len(quarantined_listings)})",
         "🌐 Liens Directs Portails (Bien'ici / Orpi / LeBonCoin / SeLoger)",
         "➕ Tester / Importer une Annonce",
     ]
 )
 
+# ==============================================================================
+# ONGLET 1 : TOUTES LES ANNONCES DU MARCHÉ (TRIÉES PAR L'IA)
+# ==============================================================================
 with tab_cockpit:
-    if all_listings:
-        f_col1, f_col2, f_col3 = st.columns([2, 2, 1])
+    if not all_active_listings:
+        st.info(
+            "👋 Aucune annonce active en base. Cliquez sur **🚀 Lancer la recherche (Live Scraping)** "
+            "dans le panneau de gauche pour extraire les annonces en direct depuis Bien'ici et les agences !"
+        )
+    else:
+        f_col1, f_col2, f_col3, f_col4 = st.columns([1.5, 1.5, 1, 1])
         with f_col1:
             default_statuses = ["a_visiter", "a_verifier"]
             if pending_list and not a_visiter_list and not a_verifier_list:
@@ -372,24 +485,84 @@ with tab_cockpit:
                 }.get(s, s),
             )
         with f_col2:
-            available_cities = sorted(list({x["city"] for x in all_listings if x.get("city")}))
+            available_cities = sorted(list({x["city"] for x in all_active_listings if x.get("city")}))
             city_choice = st.multiselect(
                 "Filtrer par ville",
                 options=available_cities,
                 default=available_cities,
             )
         with f_col3:
-            min_score_filter = st.slider("Score IA minimum", 0, 10, 0)
+            min_score_filter = st.slider("Score IA min", 0, 10, 0)
+        with f_col4:
+            selection_filter = st.selectbox(
+                "Filtre sélection",
+                options=["Toutes", "⭐ Sélectionnées uniquement", "Non sélectionnées"],
+            )
 
         filtered = [
             x
-            for x in all_listings
+            for x in all_active_listings
             if x["status"] in status_choice
             and (not city_choice or x["city"] in city_choice)
             and (x["ai_score"] is None or x["ai_score"] >= min_score_filter)
+            and (
+                selection_filter == "Toutes"
+                or (selection_filter == "⭐ Sélectionnées uniquement" and x.get("is_selected"))
+                or (selection_filter == "Non sélectionnées" and not x.get("is_selected"))
+            )
         ]
 
-        st.caption(f"Affichage de **{len(filtered)}** annonce(s) réelle(s) sur {len(all_listings)} en base.")
+        # --- MODULE D'EXPORTATION EXCEL & CSV ---
+        with st.expander("📥 Exporter les données (Excel .xlsx / CSV France)", expanded=False):
+            exp_col1, exp_col2 = st.columns(2)
+            with exp_col1:
+                scope_choice = st.radio(
+                    "Périmètre de l'export :",
+                    options=["selection_user", "filtres_actifs", "pepites", "tout"],
+                    format_func=lambda k: {
+                        "selection_user": f"⭐ Annonces sélectionnées pour visites ({len(selected_listings)} annonces)",
+                        "filtres_actifs": f"🎯 Filtres actuels ({len(filtered)} annonces)",
+                        "pepites": f"💡 Opportunités retenues IA ({len(a_visiter_list) + len(a_verifier_list)} annonces)",
+                        "tout": f"📁 Marché actif ({len(all_active_listings)} annonces)",
+                    }.get(k, k),
+                    horizontal=True,
+                )
+
+            if scope_choice == "selection_user":
+                export_pool = selected_listings
+            elif scope_choice == "filtres_actifs":
+                export_pool = filtered
+            elif scope_choice == "pepites":
+                export_pool = [x for x in all_active_listings if x["status"] in ("a_visiter", "a_verifier")]
+            else:
+                export_pool = all_active_listings
+
+            if export_pool:
+                csv_bytes, excel_bytes = generate_export_files(export_pool)
+                timestamp_str = datetime.now().strftime("%Y%m%d_%H%M")
+                with exp_col2:
+                    st.write("")
+                    dl_col1, dl_col2 = st.columns(2)
+                    with dl_col1:
+                        st.download_button(
+                            label="📊 Exporter en Excel (.xlsx)",
+                            data=excel_bytes,
+                            file_name=f"mandataire_immo_{scope_choice}_{timestamp_str}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                        )
+                    with dl_col2:
+                        st.download_button(
+                            label="📄 Exporter en CSV (Excel FR)",
+                            data=csv_bytes,
+                            file_name=f"mandataire_immo_{scope_choice}_{timestamp_str}.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                        )
+            else:
+                st.caption("Aucune annonce à exporter pour ce périmètre.")
+
+        st.caption(f"Affichage de **{len(filtered)}** annonce(s) sur {len(all_active_listings)} en base active.")
 
         for ad in filtered:
             score = ad.get("ai_score") or 0
@@ -406,9 +579,10 @@ with tab_cockpit:
             with st.container(border=True):
                 top_left, top_right = st.columns([4, 1])
                 with top_left:
+                    sel_pill = " &nbsp;|&nbsp; 🌟 **SÉLECTIONNÉE**" if ad.get("is_selected") else ""
                     st.markdown(f"### {ad['title']}")
                     st.markdown(
-                        f"{badge} &nbsp;|&nbsp; 📍 **{ad['city']} ({ad['postal_code']})** &nbsp;|&nbsp; "
+                        f"{badge}{sel_pill} &nbsp;|&nbsp; 📍 **{ad['city']} ({ad['postal_code']})** &nbsp;|&nbsp; "
                         f"🏢 **{ad['source']}** &nbsp;|&nbsp; "
                         f"🏠 **{ad['property_type']}** ({ad.get('rooms', '?')} p.) &nbsp;|&nbsp; "
                         f"🔋 DPE : **`{ad.get('dpe', 'N/C')}`** &nbsp;|&nbsp; "
@@ -427,7 +601,7 @@ with tab_cockpit:
                 elif ad.get("ai_summary"):
                     st.info(f"💡 **Avis du Mandataire IA :** {ad['ai_summary']}")
 
-                c_pros, c_cons, c_link = st.columns([2, 2, 1])
+                c_pros, c_cons = st.columns(2)
                 with c_pros:
                     if ad.get("ai_pros"):
                         st.markdown("**✅ Points forts :**")
@@ -436,19 +610,268 @@ with tab_cockpit:
                 with c_cons:
                     if ad.get("ai_cons") or ad.get("ai_signals"):
                         st.markdown("**⚠️ Vigilance & Signaux :**")
-                        for c in ad.get("ai_cons", []) + ad.get("ai_signals", []):
+                        for c in (ad.get("ai_cons") or []) + (ad.get("ai_signals") or []):
                             st.markdown(f"- {c}")
-                with c_link:
-                    st.write("")
+
+                # Ligne des boutons d'action
+                act_col1, act_col2, act_col3 = st.columns([2, 1.5, 1.5])
+                with act_col1:
                     st.link_button(
                         "🔗 Ouvrir l'annonce réelle",
                         url=ad["url"],
                         use_container_width=True,
                     )
+                with act_col2:
+                    if ad.get("is_selected"):
+                        if st.button("⭐ Sélectionnée (Retirer)", key=f"unsel_main_{ad['id']}", use_container_width=True):
+                            set_listing_selection(ad["id"], False)
+                            st.toast("Annonce retirée de la sélection.", icon="ℹ️")
+                            st.rerun()
+                    else:
+                        if st.button("⭐ Sélectionner", key=f"sel_main_{ad['id']}", type="primary", use_container_width=True):
+                            def_agency = extract_default_agency_name(ad.get("source", ""))
+                            def_phone = extract_phone_number(ad.get("description", ""))
+                            set_listing_selection(ad["id"], True, default_agency_name=def_agency, default_phone=def_phone)
+                            st.toast("⭐ Annonce ajoutée à vos annonces sélectionnées !", icon="⭐")
+                            st.rerun()
+                with act_col3:
+                    if st.button("🗑️ Supprimer", key=f"del_main_{ad['id']}", help="Masquer de la sélection et déplacer en Quarantaine", use_container_width=True):
+                        set_listing_quarantine(ad["id"], True)
+                        st.toast("🗑️ Annonce déplacée en Quarantaine (masquée).", icon="🗑️")
+                        st.rerun()
 
                 with st.expander("📄 Lire la description complète de l'annonce"):
                     st.write(ad["description"])
 
+
+# ==============================================================================
+# ONGLET 2 : ANNONCES SÉLECTIONNÉES (SUIVI DE CONTACT, VISITES & CRM)
+# ==============================================================================
+with tab_selection:
+    st.subheader(f"⭐ Vos Annonces Sélectionnées pour Visites ({len(selected_listings)})")
+    st.caption(
+        "Retrouvez ici les biens retenus pour vos démarches. Renseignez et suivez les prises de contact avec les agences "
+        "et la programmation des visites."
+    )
+
+    if not selected_listings:
+        st.info(
+            "💡 **Aucune annonce n'est encore sélectionnée.**\n\n"
+            "Pour ajouter une annonce ici, parcourez l'onglet **🎯 Annonces du Marché** et cliquez sur le bouton "
+            "**⭐ Sélectionner** sur les fiches des biens qui retiennent votre attention."
+        )
+    else:
+        cnt_contact = sum(1 for x in selected_listings if x.get("contact_made"))
+        cnt_visit = sum(1 for x in selected_listings if x.get("visit_scheduled"))
+        avg_price = sum(x["price"] for x in selected_listings) / len(selected_listings)
+
+        kpi_s1, kpi_s2, kpi_s3, kpi_s4 = st.columns(4)
+        kpi_s1.metric("⭐ Annonces retenues", len(selected_listings))
+        kpi_s2.metric("📞 Agences contactées", f"{cnt_contact} / {len(selected_listings)}")
+        kpi_s3.metric("📅 Visites programmées", f"{cnt_visit} / {len(selected_listings)}")
+        kpi_s4.metric("💶 Budget moyen sélectionné", f"{avg_price:,.0f} €".replace(",", " "))
+
+        st.divider()
+
+        for ad in selected_listings:
+            score = ad.get("ai_score") or 0
+            with st.container(border=True):
+                top_left, top_right = st.columns([4, 1])
+                with top_left:
+                    st.markdown(f"### ⭐ {ad['title']}")
+                    contact_badge = "🟢 Contact pris" if ad.get("contact_made") else "⚪ À contacter"
+                    visit_badge = "🗓️ Visite programmée" if ad.get("visit_scheduled") else "⚪ Visite à planifier"
+                    st.markdown(
+                        f"**{contact_badge}** &nbsp;|&nbsp; **{visit_badge}** &nbsp;|&nbsp; "
+                        f"📍 **{ad['city']} ({ad['postal_code']})** &nbsp;|&nbsp; "
+                        f"🏠 **{ad['property_type']}** ({ad.get('rooms', '?')} p.) &nbsp;|&nbsp; "
+                        f"🔋 DPE : **`{ad.get('dpe', 'N/C')}`** &nbsp;|&nbsp; "
+                        f"🚗 Parking/Garage : **{'Oui ✅' if ad.get('has_parking') else 'Non ❌'}**"
+                    )
+                with top_right:
+                    st.metric(
+                        label=f"{ad['surface']:g} m²",
+                        value=f"{ad['price']:,} €".replace(",", " "),
+                        delta=f"{ad.get('price_per_m2', 0):,.0f} €/m²".replace(",", " "),
+                        delta_color="off",
+                    )
+
+                if ad.get("ai_summary"):
+                    st.info(f"💡 **Synthèse IA :** {ad['ai_summary']}")
+
+                # Formulaire interactif de suivi de l'annonce
+                st.markdown("##### 📋 Suivi de la prospection & Agence :")
+                with st.form(key=f"followup_form_{ad['id']}"):
+                    f_col1, f_col2, f_col3, f_col4 = st.columns([1, 1, 1.5, 1.5])
+                    with f_col1:
+                        contact_radio = st.radio(
+                            "Contact agence établi ?",
+                            options=["Non", "Oui"],
+                            index=1 if ad.get("contact_made") else 0,
+                            horizontal=True,
+                            key=f"c_radio_{ad['id']}",
+                        )
+                    with f_col2:
+                        visit_radio = st.radio(
+                            "Visite programmée ?",
+                            options=["Non", "Oui"],
+                            index=1 if ad.get("visit_scheduled") else 0,
+                            horizontal=True,
+                            key=f"v_radio_{ad['id']}",
+                        )
+                    with f_col3:
+                        init_agency = ad.get("agency_name") or extract_default_agency_name(ad.get("source", ""))
+                        agency_name_val = st.text_input(
+                            "Nom de l'agence",
+                            value=init_agency,
+                            placeholder="Ex: Deleu Immobilier, Orpi, IAD...",
+                            key=f"ag_name_{ad['id']}",
+                        )
+                    with f_col4:
+                        init_phone = ad.get("agency_phone") or extract_phone_number(ad.get("description", ""))
+                        agency_phone_val = st.text_input(
+                            "Numéro de téléphone",
+                            value=init_phone,
+                            placeholder="Ex: 06 12 34 56 78",
+                            key=f"ag_phone_{ad['id']}",
+                        )
+
+                    followup_notes_val = st.text_area(
+                        "Notes de suivi (créneau de visite, interlocuteur, points clés à vérifier...)",
+                        value=ad.get("followup_notes") or "",
+                        placeholder="Ex: Contacté le 30/10 avec Mme Leroy. Visite samedi à 14h. Vérifier l'isolation de la toiture.",
+                        height=65,
+                        key=f"fu_notes_{ad['id']}",
+                    )
+
+                    btn_save = st.form_submit_button(
+                        "💾 Enregistrer le suivi de cette annonce",
+                        use_container_width=True,
+                        type="primary",
+                    )
+                    if btn_save:
+                        update_listing_followup(
+                            listing_id=ad["id"],
+                            contact_made=(contact_radio == "Oui"),
+                            visit_scheduled=(visit_radio == "Oui"),
+                            agency_name=agency_name_val,
+                            agency_phone=agency_phone_val,
+                            followup_notes=followup_notes_val,
+                        )
+                        st.toast("✅ Suivi mis à jour et sauvegardé !", icon="💾")
+                        st.rerun()
+
+                # Boutons d'action sous le suivi
+                b_col1, b_col2, b_col3, b_col4 = st.columns([1.5, 1.5, 1, 1])
+                with b_col1:
+                    st.link_button("🔗 Ouvrir l'annonce réelle", url=ad["url"], use_container_width=True)
+                with b_col2:
+                    current_phone = (ad.get("agency_phone") or "").strip()
+                    if current_phone:
+                        clean_tel = re.sub(r"[^0-9+]", "", current_phone)
+                        st.link_button(
+                            f"📞 Appeler ({current_phone})",
+                            url=f"tel:{clean_tel}",
+                            use_container_width=True,
+                        )
+                    else:
+                        st.caption("Numéro de téléphone non renseigné")
+                with b_col3:
+                    if st.button("❌ Retirer", key=f"unsel_tab_{ad['id']}", help="Retirer de la sélection", use_container_width=True):
+                        set_listing_selection(ad["id"], False)
+                        st.toast("Annonce retirée de la sélection.", icon="ℹ️")
+                        st.rerun()
+                with b_col4:
+                    if st.button("🗑️ Supprimer", key=f"del_tab_{ad['id']}", help="Déplacer en Quarantaine", use_container_width=True):
+                        set_listing_quarantine(ad["id"], True)
+                        st.toast("Annonce déplacée en Quarantaine.", icon="🗑️")
+                        st.rerun()
+
+                with st.expander("📄 Lire la description complète de l'annonce"):
+                    st.write(ad["description"])
+
+
+# ==============================================================================
+# ONGLET 3 : QUARANTAINE (ANNONCES SUPPRIMÉES / MASQUÉES)
+# ==============================================================================
+with tab_quarantaine:
+    st.subheader(f"🗑️ Quarantaine des Annonces ({len(quarantined_listings)})")
+    st.caption(
+        "Ces annonces ont été supprimées et ne sont plus affichées dans votre sélection principale. "
+        "Vous pouvez les restaurer à tout moment dans le flux actif ou les purger définitivement."
+    )
+
+    if not quarantined_listings:
+        st.success("✅ La quarantaine est vide. Aucune annonce n'a été supprimée.")
+    else:
+        q_act1, q_act2 = st.columns([1, 1])
+        with q_act1:
+            if st.button("♻️ Tout restaurer vers les annonces actives", use_container_width=True):
+                restored_cnt = restore_all_quarantine()
+                st.toast(f"✅ {restored_cnt} annonce(s) restaurée(s) !", icon="♻️")
+                st.rerun()
+        with q_act2:
+            if st.button("❌ Vider définitivement la quarantaine", use_container_width=True, type="secondary"):
+                deleted_cnt = empty_quarantine()
+                st.toast(f"🗑️ {deleted_cnt} annonce(s) définitivement supprimée(s).", icon="🗑️")
+                st.rerun()
+
+        st.divider()
+
+        for ad in quarantined_listings:
+            score = ad.get("ai_score") or 0
+            with st.container(border=True):
+                top_left, top_right = st.columns([4, 1])
+                with top_left:
+                    st.markdown(f"### 🗑️ {ad['title']}")
+                    st.markdown(
+                        f"🔴 **EN QUARANTAINE** (Score IA : **{score}/10**) &nbsp;|&nbsp; "
+                        f"📍 **{ad['city']} ({ad['postal_code']})** &nbsp;|&nbsp; "
+                        f"🏢 **{ad['source']}** &nbsp;|&nbsp; "
+                        f"🏠 **{ad['property_type']}** ({ad.get('rooms', '?')} p.) &nbsp;|&nbsp; "
+                        f"🔋 DPE : **`{ad.get('dpe', 'N/C')}`**"
+                    )
+                with top_right:
+                    st.metric(
+                        label=f"{ad['surface']:g} m²",
+                        value=f"{ad['price']:,} €".replace(",", " "),
+                        delta=f"{ad.get('price_per_m2', 0):,.0f} €/m²".replace(",", " "),
+                        delta_color="off",
+                    )
+
+                if ad.get("ai_rejection_reason"):
+                    st.error(f"🚫 **Motif d'exclusion IA :** {ad['ai_rejection_reason']}")
+                elif ad.get("ai_summary"):
+                    st.caption(f"💡 {ad['ai_summary']}")
+
+                q_col1, q_col2, q_col3, q_col4 = st.columns([1.5, 1.5, 1.5, 1.5])
+                with q_col1:
+                    if st.button("♻️ Restaurer", key=f"q_res_{ad['id']}", use_container_width=True):
+                        set_listing_quarantine(ad["id"], False)
+                        st.toast("Annonce restaurée dans les annonces du marché.", icon="♻️")
+                        st.rerun()
+                with q_col2:
+                    if st.button("⭐ Restaurer & Sélectionner", key=f"q_sel_{ad['id']}", type="primary", use_container_width=True):
+                        def_agency = extract_default_agency_name(ad.get("source", ""))
+                        def_phone = extract_phone_number(ad.get("description", ""))
+                        set_listing_selection(ad["id"], True, default_agency_name=def_agency, default_phone=def_phone)
+                        st.toast("Annonce restaurée et ajoutée à la sélection !", icon="⭐")
+                        st.rerun()
+                with q_col3:
+                    if st.button("❌ Supprimer définitivement", key=f"q_purge_{ad['id']}", use_container_width=True):
+                        delete_listing_permanently(ad["id"])
+                        st.toast("Annonce supprimée définitivement.", icon="🗑️")
+                        st.rerun()
+                with q_col4:
+                    st.link_button("🔗 Ouvrir l'annonce", url=ad["url"], use_container_width=True)
+
+                with st.expander("📄 Lire la description complète de l'annonce"):
+                    st.write(ad["description"])
+
+
+# ==============================================================================
+# ONGLET 4 : LIENS DIRECTS PORTAILS
+# ==============================================================================
 with tab_portails:
     st.subheader("🌐 Recherches pré-filtrées en temps réel par commune")
     st.write(
@@ -468,6 +891,10 @@ with tab_portails:
                         use_container_width=True,
                     )
 
+
+# ==============================================================================
+# ONGLET 5 : TESTER / IMPORTER UNE ANNONCE MANUELLE
+# ==============================================================================
 with tab_ajout:
     st.subheader("➕ Analyser une annonce spécifique (Copier-coller)")
     st.write("Vous avez repéré une annonce sur LeBonCoin, SeLoger ou en agence ? Soumettez-la au Cerveau IA :")
