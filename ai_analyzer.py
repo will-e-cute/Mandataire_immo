@@ -252,7 +252,7 @@ def test_gemini_api_key(api_key: Optional[str] = None, model_name: str = "gemini
     Teste instantanément (< 300 ms) la validité de la clé API Gemini auprès des serveurs Google
     sans retry bloquant ni erreur de certificat SSL local Windows.
     """
-    effective_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
+    effective_key = (os.getenv("GEMINI_API_KEY") if api_key is None else api_key).strip()
     if not effective_key:
         return {
             "ok": False,
@@ -341,7 +341,7 @@ def analyze_listing(
     Analyse une annonce immobilière via l'API Gemini ou bascule sur le moteur
     d'analyse déterministe si la clé est absente ou si le quota est dépassé.
     """
-    effective_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
+    effective_key = (os.getenv("GEMINI_API_KEY") if api_key is None else api_key).strip()
 
     if not effective_key:
         return heuristic_analyze_listing(listing, criteria)
