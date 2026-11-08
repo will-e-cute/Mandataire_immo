@@ -1,13 +1,101 @@
 import json
+import os
+import shutil
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from scraper import _canonical_city_name
 
-DB_PATH = Path(__file__).parent / "mandataire.db"
+SEED_DB_PATH = Path(__file__).parent / "mandataire.db"
 INIT_SQL_PATH = Path(__file__).parent / "init.sql"
+
+# Sur Streamlit Cloud (/mount/src), utiliser une copie de travail dans /tmp pour ne jamais
+# salir le fichier mandataire.db suivi par Git (ce qui bloquerait les git pull automatiques de Streamlit Cloud)
+IS_CLOUD_ENV = Path("/mount/src").exists() or bool(os.getenv("STREAMLIT_RUNTIME_ENV"))
+DB_PATH = Path("/tmp/mandataire_cloud_runtime.db") if IS_CLOUD_ENV else SEED_DB_PATH
+_LAST_SYNCED_SEED_MTIME: Optional[float] = None
+
+
+def _ensure_cloud_db_synced() -> None:
+    """
+    Sur Streamlit Cloud, initialise la BDD de travail depuis mandataire.db (seed Git)
+    et fusionne automatiquement les nouvelles annonces ou mises à jour des scrapers
+    si mandataire.db a été mis à jour par un git push/pull, sans écraser le suivi CRM.
+    """
+    global _LAST_SYNCED_SEED_MTIME
+    if not IS_CLOUD_ENV or not SEED_DB_PATH.exists():
+        return
+
+    seed_mtime = SEED_DB_PATH.stat().st_mtime
+    if not DB_PATH.exists():
+        shutil.copy2(SEED_DB_PATH, DB_PATH)
+        _LAST_SYNCED_SEED_MTIME = seed_mtime
+        return
+
+    if _LAST_SYNCED_SEED_MTIME is not None and seed_mtime <= _LAST_SYNCED_SEED_MTIME:
+        return
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("ATTACH DATABASE ? AS seed_db", (str(SEED_DB_PATH),))
+            # Fusionner les nouvelles annonces du seed et mettre à jour les métadonnées scrapées des existantes
+            conn.execute(
+                """
+                UPDATE listings
+                SET source = COALESCE((SELECT s.source FROM seed_db.listings s WHERE s.external_id = listings.external_id), source),
+                    title = COALESCE((SELECT s.title FROM seed_db.listings s WHERE s.external_id = listings.external_id), title),
+                    city = COALESCE((SELECT s.city FROM seed_db.listings s WHERE s.external_id = listings.external_id), city),
+                    postal_code = COALESCE((SELECT s.postal_code FROM seed_db.listings s WHERE s.external_id = listings.external_id), postal_code),
+                    description = CASE
+                        WHEN length(COALESCE((SELECT s.description FROM seed_db.listings s WHERE s.external_id = listings.external_id), '')) > length(COALESCE(listings.description, ''))
+                        THEN (SELECT s.description FROM seed_db.listings s WHERE s.external_id = listings.external_id)
+                        ELSE listings.description
+                    END,
+                    dpe = CASE
+                        WHEN listings.dpe IS NULL OR listings.dpe = 'Non renseigné'
+                        THEN COALESCE((SELECT s.dpe FROM seed_db.listings s WHERE s.external_id = listings.external_id), listings.dpe)
+                        ELSE listings.dpe
+                    END,
+                    has_parking = COALESCE((SELECT s.has_parking FROM seed_db.listings s WHERE s.external_id = listings.external_id), listings.has_parking)
+                WHERE EXISTS (SELECT 1 FROM seed_db.listings s WHERE s.external_id = listings.external_id)
+                """
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO listings (
+                    external_id, source, url, title, property_type,
+                    price, surface, rooms, city, postal_code,
+                    description, dpe, has_parking, raw_json,
+                    status, ai_score, price_per_m2, ai_summary,
+                    ai_rejection_reason, ai_pros, ai_cons, ai_signals,
+                    ai_analysis_json,
+                    is_selected, is_quarantined, contact_made, visit_scheduled,
+                    agency_name, agency_phone, followup_notes,
+                    selected_at, quarantined_at, scraped_at, analyzed_at
+                )
+                SELECT
+                    external_id, source, url, title, property_type,
+                    price, surface, rooms, city, postal_code,
+                    description, dpe, has_parking, raw_json,
+                    status, ai_score, price_per_m2, ai_summary,
+                    ai_rejection_reason, ai_pros, ai_cons, ai_signals,
+                    ai_analysis_json,
+                    is_selected, is_quarantined, contact_made, visit_scheduled,
+                    agency_name, agency_phone, followup_notes,
+                    selected_at, quarantined_at, scraped_at, analyzed_at
+                FROM seed_db.listings
+                """
+            )
+            conn.commit()
+            conn.execute("DETACH DATABASE seed_db")
+        _LAST_SYNCED_SEED_MTIME = seed_mtime
+    except Exception:
+        _LAST_SYNCED_SEED_MTIME = seed_mtime
 
 
 def get_connection() -> sqlite3.Connection:
+    _ensure_cloud_db_synced()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -69,7 +157,8 @@ def get_criteria() -> Dict[str, Any]:
             }
         data = dict(row)
         data["property_types"] = [t.strip() for t in data["property_types"].split(",") if t.strip()]
-        data["cities"] = [c.strip() for c in data["cities"].split(",") if c.strip()]
+        raw_cities = [c.strip() for c in data["cities"].split(",") if c.strip()]
+        data["cities"] = [_canonical_city_name(c) for c in raw_cities]
         data["require_parking"] = bool(data["require_parking"])
         data["exclude_dpe_fg"] = bool(data["exclude_dpe_fg"])
         data["exclude_occupied"] = bool(data["exclude_occupied"])
@@ -92,6 +181,11 @@ def save_criteria(
 ) -> None:
     """Sauvegarde les critères modifiés depuis l'interface Streamlit."""
     init_db()
+    normalized_cities = []
+    for c in cities:
+        canon = _canonical_city_name(c)
+        if canon and canon not in normalized_cities:
+            normalized_cities.append(canon)
     with get_connection() as conn:
         conn.execute(
             """
@@ -113,7 +207,7 @@ def save_criteria(
                 int(max_budget),
                 float(min_surface),
                 ",".join(property_types),
-                ",".join(cities),
+                ",".join(normalized_cities),
                 int(require_parking),
                 int(exclude_dpe_fg),
                 int(exclude_occupied),
@@ -127,20 +221,68 @@ def save_criteria(
 
 def upsert_listing(listing: Dict[str, Any]) -> bool:
     """
-    Insère une nouvelle annonce si son external_id ou son url n'existe pas encore.
-    Retourne True si l'annonce est nouvelle, False si elle existait déjà (dédoublonnage).
+    Insère une nouvelle annonce si son external_id ou son url n'existe pas encore,
+    ou enrichit/met à jour ses métadonnées scrapées (DPE, parking, description, ville, prix)
+    si elle existe déjà en préservant le tri IA et le suivi CRM.
+    Retourne True si l'annonce est nouvelle, False si elle existait déjà (et a été rafraîchie).
     """
     init_db()
     price = int(listing.get("price", 0))
     surface = float(listing.get("surface", 0.0))
     price_per_m2 = round(price / surface, 2) if surface > 0 else 0.0
+    canon_city = _canonical_city_name(str(listing.get("city", "")))
+    new_dpe = str(listing.get("dpe") or "Non renseigné").strip()
+    new_desc = str(listing.get("description") or "")
+    new_parking = None if listing.get("has_parking") is None else int(bool(listing.get("has_parking")))
 
     with get_connection() as conn:
         existing = conn.execute(
-            "SELECT id FROM listings WHERE external_id = ? OR url = ?",
+            "SELECT id, description, dpe, has_parking FROM listings WHERE external_id = ? OR url = ?",
             (listing["external_id"], listing["url"]),
         ).fetchone()
         if existing:
+            old_desc = str(existing["description"] or "")
+            best_desc = new_desc if len(new_desc) >= len(old_desc) else old_desc
+            old_dpe = str(existing["dpe"] or "Non renseigné")
+            best_dpe = new_dpe if new_dpe in ("A", "B", "C", "D", "E", "F", "G") else old_dpe
+            best_parking = new_parking if new_parking is not None else existing["has_parking"]
+
+            conn.execute(
+                """
+                UPDATE listings
+                SET source = ?,
+                    title = ?,
+                    property_type = ?,
+                    price = ?,
+                    surface = ?,
+                    rooms = ?,
+                    city = ?,
+                    postal_code = ?,
+                    description = ?,
+                    dpe = ?,
+                    has_parking = ?,
+                    price_per_m2 = ?,
+                    raw_json = ?
+                WHERE id = ?
+                """,
+                (
+                    listing.get("source", "Manuel"),
+                    listing["title"],
+                    listing.get("property_type", "Autre"),
+                    price,
+                    surface,
+                    int(listing.get("rooms", 0)),
+                    canon_city,
+                    listing.get("postal_code", ""),
+                    best_desc,
+                    best_dpe,
+                    best_parking,
+                    price_per_m2,
+                    json.dumps(listing, ensure_ascii=False),
+                    existing["id"],
+                ),
+            )
+            conn.commit()
             return False
 
         conn.execute(
@@ -161,11 +303,11 @@ def upsert_listing(listing: Dict[str, Any]) -> bool:
                 price,
                 surface,
                 int(listing.get("rooms", 0)),
-                listing.get("city", ""),
+                canon_city,
                 listing.get("postal_code", ""),
-                listing.get("description", ""),
-                listing.get("dpe", "Non renseigné"),
-                None if listing.get("has_parking") is None else int(bool(listing.get("has_parking"))),
+                new_desc,
+                new_dpe,
+                new_parking,
                 price_per_m2,
                 json.dumps(listing, ensure_ascii=False),
             ),
@@ -455,13 +597,22 @@ def export_db_to_json() -> str:
 
 
 def import_db_from_json(json_str: str) -> int:
-    """Restaure les critères, annonces et suivi IA/CRM depuis un export JSON sans écraser les doublons."""
+    """Restaure les critères, annonces et suivi IA/CRM depuis un export JSON en préservant les enrichissements des nouveaux scrapers."""
     init_db()
     data = json.loads(json_str)
 
-    # Restauration éventuelle des critères
+    # Restauration éventuelle des critères avec normalisation orthographique des villes
     criteria = data.get("search_criteria")
     if criteria and isinstance(criteria, dict):
+        raw_cities_val = criteria.get("cities")
+        if isinstance(raw_cities_val, str):
+            raw_list = [c.strip() for c in raw_cities_val.split(",") if c.strip()]
+        elif isinstance(raw_cities_val, list):
+            raw_list = [str(c).strip() for c in raw_cities_val if str(c).strip()]
+        else:
+            raw_list = []
+        canon_cities_str = ",".join(_canonical_city_name(c) for c in raw_list) if raw_list else None
+
         with get_connection() as conn:
             conn.execute(
                 """
@@ -483,7 +634,7 @@ def import_db_from_json(json_str: str) -> int:
                     criteria.get("max_budget"),
                     criteria.get("min_surface"),
                     criteria.get("property_types") if isinstance(criteria.get("property_types"), str) else ",".join(criteria.get("property_types", [])),
-                    criteria.get("cities") if isinstance(criteria.get("cities"), str) else ",".join(criteria.get("cities", [])),
+                    canon_cities_str,
                     criteria.get("require_parking"),
                     criteria.get("exclude_dpe_fg"),
                     criteria.get("exclude_occupied"),
@@ -498,6 +649,26 @@ def import_db_from_json(json_str: str) -> int:
     restored = 0
     with get_connection() as conn:
         for item in listings:
+            canon_city = _canonical_city_name(str(item.get("city", "")))
+            existing = conn.execute(
+                "SELECT description, dpe, has_parking FROM listings WHERE external_id = ?",
+                (item["external_id"],),
+            ).fetchone()
+
+            imp_desc = str(item.get("description") or "")
+            imp_dpe = str(item.get("dpe") or "Non renseigné")
+            imp_parking = item.get("has_parking")
+
+            if existing:
+                ex_desc = str(existing["description"] or "")
+                if len(ex_desc) > len(imp_desc):
+                    imp_desc = ex_desc
+                ex_dpe = str(existing["dpe"] or "Non renseigné")
+                if imp_dpe not in ("A", "B", "C", "D", "E", "F", "G") and ex_dpe in ("A", "B", "C", "D", "E", "F", "G"):
+                    imp_dpe = ex_dpe
+                if imp_parking is None and existing["has_parking"] is not None:
+                    imp_parking = existing["has_parking"]
+
             conn.execute(
                 """
                 INSERT OR REPLACE INTO listings (
@@ -521,11 +692,11 @@ def import_db_from_json(json_str: str) -> int:
                     int(item.get("price", 0)),
                     float(item.get("surface", 0.0)),
                     int(item.get("rooms", 0)),
-                    item.get("city", ""),
+                    canon_city,
                     item.get("postal_code", ""),
-                    item.get("description", ""),
-                    item.get("dpe", "Non renseigné"),
-                    item.get("has_parking"),
+                    imp_desc,
+                    imp_dpe,
+                    imp_parking,
                     item.get("raw_json", "{}"),
                     item.get("status", "pending_analysis"),
                     item.get("ai_score"),

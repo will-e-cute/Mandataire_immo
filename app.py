@@ -359,9 +359,12 @@ if launch_search:
         stats = scrape_report["stats"]
 
         new_count = 0
+        updated_count = 0
         for ad in all_fetched:
             if upsert_listing(ad):
                 new_count += 1
+            else:
+                updated_count += 1
 
         if reanalyze_existing:
             reset_all_listings_to_pending()
@@ -371,7 +374,8 @@ if launch_search:
             label=(
                 f"📥 Collecte terminée : {stats['total']} annonces récupérées "
                 f"({stats.get('seloger', 0)} SeLoger, {stats['bienici_agences']} Bien'ici, {stats['orpi_direct']} Orpi) — "
-                f"{new_count} nouvelles en base. Démarrage du tri parallèle sur {len(pending_after_scrape)} annonces..."
+                f"{new_count} nouvelles + {updated_count} mises à jour en base. "
+                f"Démarrage du tri parallèle sur {len(pending_after_scrape)} annonces..."
             ),
             state="complete",
             expanded=False,
