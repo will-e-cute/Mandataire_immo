@@ -1,3 +1,4 @@
+import difflib
 import hashlib
 import json
 import random
@@ -9,9 +10,22 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from bs4 import BeautifulSoup
 
+try:
+    from curl_cffi import requests as cffi_requests
+    HAS_CURL_CFFI = True
+except (ImportError, ModuleNotFoundError):
+    cffi_requests = None
+    HAS_CURL_CFFI = False
+
+CITY_TYPO_FIXES = {
+    "bareoul": "baroeul",
+    "marcq en bareoul": "marcq en baroeul",
+    "villeneuve dascq": "villeneuve d ascq",
+}
+
 
 def _normalize_city(text: str) -> str:
-    """Normalise le nom d'une commune (sans accents, ligatures ni ponctuation) pour comparaison fiable."""
+    """Normalise le nom d'une commune (sans accents, ligatures ni ponctuation, avec correction des fautes de frappe courantes)."""
     if not text:
         return ""
     text = str(text).lower().strip()
@@ -19,7 +33,25 @@ def _normalize_city(text: str) -> str:
     text = unicodedata.normalize("NFKD", text)
     text = "".join(c for c in text if not unicodedata.combining(c))
     text = re.sub(r"[-'’_./]", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    for wrong, right in CITY_TYPO_FIXES.items():
+        if wrong in text:
+            text = text.replace(wrong, right)
+    return text
+
+
+def _match_known_city(city_name: str) -> Optional[str]:
+    """Trouve le nom canonique dans CITY_METADATA même en cas de légère faute de frappe (ex: 'marcq en bareoul')."""
+    norm = _normalize_city(city_name)
+    if not norm:
+        return None
+    norm_map = {_normalize_city(k): k for k in CITY_METADATA}
+    if norm in norm_map:
+        return norm_map[norm]
+    close = difflib.get_close_matches(norm, list(norm_map.keys()), n=1, cutoff=0.82)
+    if close:
+        return norm_map[close[0]]
+    return None
 
 
 def _city_matches_targets(ad_city: str, target_cities: List[str]) -> bool:
@@ -29,24 +61,28 @@ def _city_matches_targets(ad_city: str, target_cities: List[str]) -> bool:
     norm_ad = _normalize_city(ad_city)
     if not norm_ad:
         return True
+    canon_ad = _match_known_city(ad_city)
     for target in target_cities:
         norm_t = _normalize_city(target)
         if norm_t and (norm_t == norm_ad or norm_t in norm_ad or norm_ad in norm_t):
+            return True
+        if canon_ad and _match_known_city(target) == canon_ad:
             return True
     return False
 
 
 def _canonical_city_name(ad_city: str, target_cities: Optional[List[str]] = None) -> str:
-    """Unifie la graphie du nom de ville (ex: 'Marcq-en-Baroeul' -> 'Marcq-en-Barœul') pour éviter les doublons de filtre."""
+    """Unifie la graphie du nom de ville (ex: 'marcq en bareoul' / 'Marcq-en-Baroeul' -> 'Marcq-en-Barœul') pour éviter les doublons de filtre."""
+    matched = _match_known_city(ad_city)
+    if matched:
+        return matched
     norm_ad = _normalize_city(ad_city)
     if not norm_ad:
         return ad_city.strip()
-    for known_city in CITY_METADATA:
-        if _normalize_city(known_city) == norm_ad:
-            return known_city
     for target in (target_cities or []):
         if _normalize_city(target) == norm_ad:
-            return target.strip()
+            matched_t = _match_known_city(target)
+            return matched_t or target.strip()
     return ad_city.strip()
 
 
@@ -201,6 +237,9 @@ def _detect_parking_in_text(text: str, explicit_flag: Optional[bool] = None) -> 
 
 
 def _get_city_meta(city_name: str) -> Dict[str, str]:
+    matched = _match_known_city(city_name)
+    if matched and matched in CITY_METADATA:
+        return CITY_METADATA[matched]
     c_norm = _normalize_city(city_name)
     for known_city, meta in CITY_METADATA.items():
         if _normalize_city(known_city) == c_norm:
@@ -213,16 +252,53 @@ def _get_city_meta(city_name: str) -> Dict[str, str]:
     }
 
 
+def _infer_referer(url: str) -> str:
+    if "seloger.com" in url:
+        return "https://www.seloger.com/"
+    if "bienici.com" in url:
+        return "https://www.bienici.com/recherche/achat/france"
+    if "orpi.com" in url:
+        return "https://www.orpi.com/"
+    return "https://www.google.fr/"
+
+
 def robust_http_get(
     client: httpx.Client,
     url: str,
     max_retries: int = 2,
     backoff: float = 1.0,
-) -> Optional[httpx.Response]:
-    """Exécute une requête GET avec retry et backoff exponentiel pour absorber les micro-coupures et rate limits."""
+) -> Optional[Any]:
+    """
+    Exécute une requête GET avec contournement anti-WAF (empreinte TLS/HTTP2 Chrome via curl_cffi
+    pour Streamlit Cloud, et fallback httpx) avec retry et backoff exponentiel.
+    """
+    accept_json = ".json" in url or "realEstateAds" in url or "place.json" in url
+    req_headers = get_browser_headers(accept_json=accept_json)
+    req_headers["Referer"] = _infer_referer(url)
+
     for attempt in range(max_retries + 1):
+        # 1. Priorité à curl_cffi (empreinte TLS JA3/JA4 Chrome native, idéal sur Streamlit Cloud face à DataDome/Cloudflare)
+        if HAS_CURL_CFFI and cffi_requests is not None:
+            try:
+                cffi_resp = cffi_requests.get(
+                    url,
+                    impersonate="chrome",
+                    headers=req_headers,
+                    verify=False,
+                    timeout=14,
+                    allow_redirects=True,
+                )
+                if cffi_resp.status_code == 200:
+                    return cffi_resp
+                if cffi_resp.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                    time.sleep(backoff * (attempt + 1))
+                    continue
+            except Exception:
+                pass
+
+        # 2. Fallback httpx standard
         try:
-            resp = client.get(url)
+            resp = client.get(url, headers=req_headers)
             if resp.status_code in (429, 500, 502, 503, 504):
                 if attempt < max_retries:
                     time.sleep(backoff * (attempt + 1))
@@ -306,6 +382,10 @@ def _format_agency_source(ad_id: str, account_name: str = "") -> str:
 
 def resolve_bienici_zone_id(client: httpx.Client, city_name: str) -> List[str]:
     """Résout dynamiquement le zoneId Bien'ici pour n'importe quelle ville saisie par l'utilisateur."""
+    matched = _match_known_city(city_name)
+    if matched and CITY_METADATA[matched].get("bienici_zone_id"):
+        return [CITY_METADATA[matched]["bienici_zone_id"]]
+
     c_norm = _normalize_city(city_name)
     for known_city, meta in CITY_METADATA.items():
         if _normalize_city(known_city) == c_norm and meta.get("bienici_zone_id"):
@@ -543,15 +623,38 @@ def scrape_orpi_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List[Di
         type_params.append(f"realEstateTypes[{len(type_params)}]=appartement")
     type_query = ("&" + "&".join(type_params)) if type_params else ""
 
+    # Construire une requête multi-villes + les requêtes unitaires pour maximiser la couverture Orpi
+    orpi_slugs = []
+    for city in cities:
+        meta = _get_city_meta(city)
+        slug = meta.get("orpi_slug") or _normalize_city(city).replace(" ", "-")
+        if slug and slug not in orpi_slugs:
+            orpi_slugs.append(slug)
+
+    urls_to_fetch: List[Tuple[str, str]] = []
+    if len(orpi_slugs) > 1:
+        multi_loc = "&".join(
+            f"locations[{i}][value]={urllib.parse.quote(s)}" for i, s in enumerate(orpi_slugs)
+        )
+        urls_to_fetch.append(
+            (
+                cities[0],
+                f"https://www.orpi.com/recherche/buy?{multi_loc}{type_query}",
+            )
+        )
+    for city in cities:
+        meta = _get_city_meta(city)
+        orpi_slug = meta.get("orpi_slug") or _normalize_city(city).replace(" ", "-")
+        urls_to_fetch.append(
+            (
+                city,
+                f"https://www.orpi.com/recherche/buy?locations[0][value]={urllib.parse.quote(orpi_slug)}{type_query}",
+            )
+        )
+
     headers = get_browser_headers(accept_json=False)
     with httpx.Client(headers=headers, timeout=timeout, follow_redirects=True, verify=False) as client:
-        for city in cities:
-            meta = _get_city_meta(city)
-            orpi_slug = meta.get("orpi_slug") or _normalize_city(city).replace(" ", "-")
-            url = (
-                f"https://www.orpi.com/recherche/buy?locations[0][value]={urllib.parse.quote(orpi_slug)}"
-                f"{type_query}&maxPrice={max_budget}&minSurface={int(min_surface)}"
-            )
+        for city, url in urls_to_fetch:
             try:
                 resp = robust_http_get(client, url, max_retries=1)
                 html_text = ""
@@ -669,6 +772,10 @@ def scrape_orpi_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List[Di
 
 def resolve_seloger_place_id(client: httpx.Client, city_name: str) -> str:
     """Résout le placeId SeLoger (ex: AD08FR23435) pour une commune donnée."""
+    matched = _match_known_city(city_name)
+    if matched and CITY_METADATA[matched].get("seloger_place_id"):
+        return CITY_METADATA[matched]["seloger_place_id"]
+
     c_norm = _normalize_city(city_name)
     for known_city, meta in CITY_METADATA.items():
         if _normalize_city(known_city) == c_norm and meta.get("seloger_place_id"):
