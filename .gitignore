@@ -15,7 +15,8 @@ __pycache__/
 .idea/
 .vscode/
 
-# Base de données locale SQLite (optionnel : décommenter si vous ne souhaitez pas versionner mandataire.db)
+# Base de données locale SQLite (protège les notes CRM et numéros de téléphone privés)
+*.db
 *.db-journal
 *.db-wal
 *.db-shm

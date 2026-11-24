@@ -18,7 +18,7 @@ Développer une application autonome en local (via `.venv` Python, sans Docker) 
 | **Environnement** | Python 3.13 (`.venv` local) | Isolation complète des dépendances sans Docker. |
 | **Orchestration / Scraping** | Python (`httpx` / `BeautifulSoup` / `Playwright`) | Collecte multi-sources (Bien'ici, SeLoger, LeBonCoin) + résilience anti-WAF automatique. |
 | **Base de données** | SQLite (`mandataire.db` + `init.sql`) | Stockage relationnel local sans serveur, dédoublonnage par URL/ID, persistance des critères, statuts CRM et quarantaine. |
-| **Moteur d'Analyse (IA)** | API Gemini (`gemini-3.8-flash` & fallback local) | Extraction structurée JSON (Pydantic) avec parallélisation multi-threads et circuit-breaker anti-quota. |
+| **Moteur d'Analyse (IA)** | API Gemini (`gemini-4-hydrogen` & fallback local) | Extraction structurée JSON (Pydantic) avec parallélisation multi-threads et circuit-breaker anti-quota. |
 | **Interface Utilisateur** | Streamlit (`app.py`) | Cockpit interactif avec gestion de sélection, suivi d'agences/visites, quarantaine restaurable et exports Excel/CSV. |
 
 ---

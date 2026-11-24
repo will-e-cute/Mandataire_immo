@@ -13,12 +13,18 @@ from database import (
     delete_all_listings,
     delete_listing_permanently,
     empty_quarantine,
+    export_db_to_json,
     get_all_listings,
     get_criteria,
+    get_existing_orpi_descriptions,
     get_pending_listings,
     get_quarantined_listings,
     get_selected_listings,
+    get_unavailable_listings,
+    import_db_from_json,
     init_db,
+    mark_listings_availability_batch,
+    quarantine_unavailable_listings,
     reset_all_listings_to_pending,
     restore_all_quarantine,
     save_criteria,
@@ -26,12 +32,17 @@ from database import (
     set_listing_selection,
     update_listing_analysis,
     update_listing_followup,
+    update_listings_analysis_batch,
     upsert_listing,
+    upsert_listings_batch,
 )
 from ai_analyzer import analyze_listing, analyze_listings_parallel, test_gemini_api_key
 from scraper import (
     CITY_METADATA,
     build_portal_search_links,
+    check_listings_availability_batch,
+    detect_unavailable_reason,
+    parse_leboncoin_payload,
     scrape_all_live_sources,
 )
 
@@ -49,12 +60,30 @@ st.set_page_config(
 init_db()
 current_criteria = get_criteria()
 
+
+def _get_default_gemini_key() -> str:
+    """Récupère la clé Gemini depuis st.secrets (Streamlit Cloud) ou depuis les variables d'environnement (.env)."""
+    try:
+        if "GEMINI_API_KEY" in st.secrets:
+            return str(st.secrets["GEMINI_API_KEY"]).strip()
+    except Exception:
+        pass
+    return os.getenv("GEMINI_API_KEY", "").strip()
+
+
 if "gemini_api_key" not in st.session_state:
-    st.session_state["gemini_api_key"] = os.getenv("GEMINI_API_KEY", "")
+    st.session_state["gemini_api_key"] = _get_default_gemini_key()
 if "analysis_running" not in st.session_state:
     st.session_state["analysis_running"] = False
 if "analysis_paused" not in st.session_state:
     st.session_state["analysis_paused"] = False
+
+
+def _safe_md_text(text: str) -> str:
+    """Neutralise les séquences d'images/liens Markdown externes dans les titres/sources issus du web."""
+    if not text:
+        return ""
+    return re.sub(r"[!\[\]]", "", str(text)).strip()
 
 
 def extract_phone_number(text: str) -> str:
@@ -110,7 +139,11 @@ def generate_export_files(listings_to_export: List[Dict[str, Any]]) -> Tuple[byt
                 "Téléphone Agence": l.get("agency_phone") or "",
                 "Notes Suivi": l.get("followup_notes") or "",
                 "Statut IA": status_fr,
+                "Disponibilité": "✅ Disponible"
+                if l.get("is_available", True)
+                else f"🚫 Indisponible ({l.get('unavailable_reason') or 'Retirée / vendue'})",
                 "Score IA (/10)": l.get("ai_score"),
+                "Transaction": "Location" if l.get("transaction_type") == "rent" else "Achat",
                 "Titre": l.get("title"),
                 "Ville": l.get("city"),
                 "Code Postal": l.get("postal_code"),
@@ -118,6 +151,7 @@ def generate_export_files(listings_to_export: List[Dict[str, Any]]) -> Tuple[byt
                 "Surface (m²)": l.get("surface"),
                 "Prix/m² (€/m²)": l.get("price_per_m2"),
                 "Pièces": l.get("rooms"),
+                "Chambres": l.get("bedrooms", 0),
                 "DPE": l.get("dpe"),
                 "Parking / Garage": "Oui" if l.get("has_parking") else "Non",
                 "Source": l.get("source"),
@@ -145,6 +179,138 @@ def generate_export_files(listings_to_export: List[Dict[str, Any]]) -> Tuple[byt
     return csv_bytes, excel_bytes
 
 
+TABLE_COLUMNS = [
+    "Sélectionné",
+    "Statut IA",
+    "Disponibilité",
+    "Score IA",
+    "Transaction",
+    "Type",
+    "Ville",
+    "Code Postal",
+    "Titre",
+    "Prix (€)",
+    "Surface (m²)",
+    "Prix/m² (€)",
+    "Pièces",
+    "Chambres",
+    "DPE",
+    "Parking",
+    "Source",
+    "URL",
+    "Synthèse IA",
+    "Motif de rejet",
+    "Points forts",
+    "Points de vigilance",
+    "Signaux faibles",
+    "Contact Agence",
+    "Visite Programmée",
+    "Nom Agence",
+    "Téléphone Agence",
+    "Date Scraping",
+    "Date Analyse",
+]
+
+DEFAULT_TABLE_COLUMNS = [
+    "Sélectionné",
+    "Statut IA",
+    "Score IA",
+    "Type",
+    "Ville",
+    "Titre",
+    "Prix (€)",
+    "Surface (m²)",
+    "Prix/m² (€)",
+    "Pièces",
+    "Chambres",
+    "DPE",
+    "Parking",
+    "Source",
+    "URL",
+]
+
+
+def _format_list_field(value: Any) -> str:
+    if not value:
+        return ""
+    if isinstance(value, list):
+        return " | ".join(str(x) for x in value)
+    return str(value)
+
+
+def build_table_dataframe(listings: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Construit un DataFrame typé pour l'affichage tableau interactif (tri numérique/booléen natif)."""
+    if not listings:
+        empty_df = pd.DataFrame(columns=TABLE_COLUMNS)
+        empty_df["Sélectionné"] = empty_df["Sélectionné"].astype(bool)
+        empty_df["Score IA"] = pd.array([], dtype="Int64")
+        empty_df["Prix (€)"] = pd.Series(dtype="int64")
+        empty_df["Surface (m²)"] = pd.Series(dtype="float64")
+        empty_df["Prix/m² (€)"] = pd.Series(dtype="float64")
+        empty_df["Pièces"] = pd.Series(dtype="int64")
+        empty_df["Chambres"] = pd.Series(dtype="int64")
+        empty_df["Parking"] = empty_df["Parking"].astype(bool)
+        empty_df["Contact Agence"] = empty_df["Contact Agence"].astype(bool)
+        empty_df["Visite Programmée"] = empty_df["Visite Programmée"].astype(bool)
+        return empty_df
+
+    status_labels = {
+        "a_visiter": "🟢 À visiter",
+        "a_verifier": "🟡 À vérifier",
+        "pending_analysis": "⏳ En attente",
+        "rejete": "🔴 Rejeté",
+    }
+    rows = []
+    scores = []
+    for l in listings:
+        price = int(l.get("price") or 0)
+        surface = float(l.get("surface") or 0.0)
+        raw_pm2 = l.get("price_per_m2")
+        price_per_m2 = float(raw_pm2) if raw_pm2 is not None else (round(price / surface, 2) if surface > 0 else 0.0)
+        raw_score = l.get("ai_score")
+        scores.append(int(raw_score) if raw_score is not None else pd.NA)
+
+        rows.append(
+            {
+                "Sélectionné": bool(l.get("is_selected")),
+                "Statut IA": status_labels.get(l.get("status"), str(l.get("status") or "")),
+                "Disponibilité": "✅ Disponible"
+                if l.get("is_available", True)
+                else f"🚫 Indisponible ({l.get('unavailable_reason') or 'Retirée / vendue'})",
+                "Score IA": 0,
+                "Transaction": "Location" if l.get("transaction_type") == "rent" else "Achat",
+                "Type": str(l.get("property_type") or ""),
+                "Ville": str(l.get("city") or ""),
+                "Code Postal": str(l.get("postal_code") or ""),
+                "Titre": str(l.get("title") or ""),
+                "Prix (€)": price,
+                "Surface (m²)": surface,
+                "Prix/m² (€)": price_per_m2,
+                "Pièces": int(l.get("rooms") or 0),
+                "Chambres": int(l.get("bedrooms") or 0),
+                "DPE": str(l.get("dpe") or "Non renseigné"),
+                "Parking": bool(l.get("has_parking")),
+                "Source": str(l.get("source") or ""),
+                "URL": str(l.get("url") or ""),
+                "Synthèse IA": str(l.get("ai_summary") or ""),
+                "Motif de rejet": str(l.get("ai_rejection_reason") or ""),
+                "Points forts": _format_list_field(l.get("ai_pros")),
+                "Points de vigilance": _format_list_field(l.get("ai_cons")),
+                "Signaux faibles": _format_list_field(l.get("ai_signals")),
+                "Contact Agence": bool(l.get("contact_made")),
+                "Visite Programmée": bool(l.get("visit_scheduled")),
+                "Nom Agence": str(l.get("agency_name") or ""),
+                "Téléphone Agence": str(l.get("agency_phone") or ""),
+                "Date Scraping": str(l.get("scraped_at") or ""),
+                "Date Analyse": str(l.get("analyzed_at") or ""),
+            }
+        )
+
+    df = pd.DataFrame(rows, columns=TABLE_COLUMNS)
+    df["Score IA"] = pd.array(scores, dtype="Int64")
+    return df
+
+
 # --- BARRE LATÉRALE : CLÉ API GEMINI, PARALLÉLISME & CRITÈRES DE RECHERCHE ---
 with st.sidebar:
     st.title("🤖 Moteur IA (Gemini)")
@@ -153,7 +319,7 @@ with st.sidebar:
         value=st.session_state["gemini_api_key"],
         type="password",
         placeholder="AIzaSy...",
-        help="Votre clé API est utilisée avec gemini-3.8-flash et peut être sauvegardée dans le fichier local .env.",
+        help="Votre clé API est utilisée avec gemini-4-hydrogen (via st.secrets en Cloud ou .env en local).",
     )
     st.session_state["gemini_api_key"] = api_key_input.strip()
 
@@ -192,21 +358,52 @@ with st.sidebar:
     st.caption("Modifiez vos variables ci-dessous puis cliquez sur **Lancer la recherche**.")
 
     with st.form("criteria_form"):
-        st.subheader("1. Budget & Surface")
+        st.subheader("1. Transaction, Budget & Surface")
+        current_tx = str(current_criteria.get("transaction_type", "buy")).strip().lower()
+        tx_choice_label = st.radio(
+            "Type de transaction",
+            options=["Achat", "Location"],
+            index=1 if current_tx == "rent" else 0,
+            horizontal=True,
+        )
+        selected_tx_type = "rent" if tx_choice_label == "Location" else "buy"
+
+        saved_budget = int(current_criteria.get("max_budget", 280000))
         max_budget = st.number_input(
-            "Budget maximum FAI (€)",
-            min_value=50000,
-            max_value=2000000,
-            value=int(current_criteria.get("max_budget", 280000)),
-            step=5000,
+            "Budget maximum (€ FAI en Achat / €/mois CC en Location)",
+            min_value=250,
+            max_value=3000000,
+            value=max(250, saved_budget),
+            step=100 if selected_tx_type == "rent" else 5000,
+            help="En Achat : ex. 280 000 €. En Location : loyer mensuel max (ex. 1 200 €).",
         )
         min_surface = st.number_input(
             "Surface minimale (m²)",
-            min_value=20.0,
+            min_value=15.0,
             max_value=500.0,
             value=float(current_criteria.get("min_surface", 80.0)),
             step=5.0,
         )
+
+        rc_col1, rc_col2 = st.columns(2)
+        with rc_col1:
+            min_rooms = st.number_input(
+                "Pièces min.",
+                min_value=0,
+                max_value=15,
+                value=int(current_criteria.get("min_rooms", 0)),
+                step=1,
+                help="0 = sans filtre sur le nombre de pièces.",
+            )
+        with rc_col2:
+            min_bedrooms = st.number_input(
+                "Chambres min.",
+                min_value=0,
+                max_value=10,
+                value=int(current_criteria.get("min_bedrooms", 0)),
+                step=1,
+                help="0 = sans filtre sur le nombre de chambres.",
+            )
 
         st.subheader("2. Type de bien & Secteur")
         default_types = current_criteria.get("property_types", ["Maison", "Appartement"])
@@ -256,8 +453,9 @@ with st.sidebar:
         )
 
         reanalyze_existing = st.checkbox(
-            "🔄 Ré-évaluer aussi les annonces déjà en base avec ces critères",
-            value=True,
+            "🔄 Ré-évaluer aussi toutes les annonces déjà en base avec ces critères",
+            value=False,
+            help="Cochez uniquement si vous venez de modifier vos critères et souhaitez recalculer le tri sur tout l'historique.",
         )
 
         launch_search = st.form_submit_button(
@@ -291,11 +489,59 @@ with st.sidebar:
         st.session_state["analysis_paused"] = False
         st.session_state["analysis_running"] = True
 
+    active_for_check = get_all_listings(include_quarantined=False, include_unavailable=False)
+    check_avail_btn = st.button(
+        f"🔍 Vérifier la disponibilité ({len(active_for_check)})",
+        use_container_width=True,
+        disabled=(len(active_for_check) == 0),
+        help="Interroge en direct Bien'ici et Orpi et détecte les mentions 'vendu / sous compromis' pour masquer les annonces retirées du marché.",
+    )
+    if check_avail_btn:
+        avail_prog = st.progress(0, text=f"🔍 Vérification de la disponibilité (0 / {len(active_for_check)})...")
+        avail_step = max(1, min(15, len(active_for_check) // 20))
+
+        def _on_avail_prog(done: int, total: int) -> None:
+            if done % avail_step == 0 or done == total:
+                avail_prog.progress(done / max(1, total), text=f"🔍 Vérification en direct : {done} / {total}...")
+
+        avail_updates = check_listings_availability_batch(
+            active_for_check,
+            max_workers=8,
+            on_progress=_on_avail_prog,
+        )
+        marked_unavail, confirmed_avail = mark_listings_availability_batch(avail_updates)
+        st.session_state["availability_report"] = {
+            "checked": len(active_for_check),
+            "confirmed_available": confirmed_avail,
+            "marked_unavailable": marked_unavail,
+        }
+        st.rerun()
+
     if st.button("🗑️ Vider la base d'annonces", use_container_width=True):
         st.session_state["analysis_running"] = False
         delete_all_listings()
         st.toast("Base de données vidée.", icon="🗑️")
         st.rerun()
+
+    st.divider()
+    with st.expander("☁️ Sauvegarde / Restauration Cloud (JSON)"):
+        st.caption(
+            "Sur Streamlit Cloud, le conteneur peut se réinitialiser lors des mises en veille. "
+            "Téléchargez ou restaurez vos annonces, sélections et suivis CRM en 1 clic :"
+        )
+        st.download_button(
+            label="📥 Exporter la BDD complète (.json)",
+            data=export_db_to_json(),
+            file_name=f"mandataire_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+        uploaded_backup = st.file_uploader("📤 Importer une sauvegarde (.json)", type=["json"])
+        if uploaded_backup is not None:
+            if st.button("Restaurer ce fichier", use_container_width=True):
+                restored_count = import_db_from_json(uploaded_backup.getvalue().decode("utf-8"))
+                st.success(f"✅ {restored_count} annonce(s) et critères restaurés avec succès !")
+                st.rerun()
 
 
 # --- ACTION 1 : LANCEMENT DU SCRAPING LIVE AVEC RÉSILIENCE WAF ---
@@ -303,8 +549,11 @@ if launch_search:
     st.session_state["analysis_paused"] = False
     parsed_cities = [c.strip() for c in cities_text.split(",") if c.strip()]
     save_criteria(
+        transaction_type=selected_tx_type,
         max_budget=max_budget,
         min_surface=min_surface,
+        min_rooms=min_rooms,
+        min_bedrooms=min_bedrooms,
         property_types=property_types or ["Maison", "Appartement"],
         cities=parsed_cities,
         require_parking=require_parking,
@@ -316,29 +565,56 @@ if launch_search:
     )
     current_criteria = get_criteria()
 
-    with st.status("🔍 Collecte Live (SeLoger + Bien'ici + Agences & Orpi + Fallback Playwright)...", expanded=True) as status_box:
+    with st.status("🔍 Collecte Live Parallèle (SeLoger + Bien'ici + Orpi + LeBonCoin)...", expanded=True) as status_box:
         st.write(
-            f"1️⃣ Interrogation en direct de **SeLoger.com**, **Bien'ici** (IAD, Safti, Citya, Square Habitat, Guy Hoquet, ERA, Sergic...) "
-            f"et **Orpi** sur : **{', '.join(parsed_cities)}** (avec protection anti-WAF active)..."
+            f"1️⃣ Interrogation simultanée sur 4 threads de **SeLoger.com**, **Bien'ici**, "
+            f"**Orpi** et **LeBonCoin** sur : **{', '.join(parsed_cities)}**..."
         )
-        scrape_report = scrape_all_live_sources(current_criteria)
+        orpi_cache = get_existing_orpi_descriptions()
+        scrape_report = scrape_all_live_sources(current_criteria, existing_orpi_cache=orpi_cache)
         all_fetched = scrape_report["ads"]
         stats = scrape_report["stats"]
 
-        new_count = 0
-        for ad in all_fetched:
-            if upsert_listing(ad):
-                new_count += 1
+        if stats.get("leboncoin_blocked"):
+            st.warning(
+                "⚠️ **LeBonCoin a présenté un portail anti-bot (DataDome 403).** "
+                "Pour importer les annonces LeBonCoin (Particuliers & Pros) en 1 clic, ouvrez le lien de recherche LeBonCoin "
+                "dans votre navigateur (onglet *🌐 Liens Directs Portails*), faites `Ctrl+U` (Code source) et collez-le dans "
+                "l'onglet *➕ Tester / Importer une Annonce* (ou renseignez `LEBONCOIN_COOKIE` dans `.env`)."
+            )
+
+        new_count, updated_count = upsert_listings_batch(all_fetched)
+
+        # Vérification automatique de disponibilité sur les annonces déjà en base absentes de ce scraping
+        fresh_ext_ids = {ad["external_id"] for ad in all_fetched}
+        existing_active = get_all_listings(include_quarantined=False, include_unavailable=False)
+        stale_candidates = [x for x in existing_active if x.get("external_id") not in fresh_ext_ids]
+        priority_rank = {"a_visiter": 1, "a_verifier": 2, "pending_analysis": 3, "rejete": 4}
+        stale_candidates.sort(
+            key=lambda x: (0 if x.get("is_selected") else priority_rank.get(x.get("status"), 5))
+        )
+        stale_to_check = stale_candidates[:200]
+        auto_unavail_count = 0
+        if stale_to_check:
+            st.write(
+                f"2️⃣ Vérification de disponibilité en direct sur **{len(stale_to_check)}** annonce(s) "
+                "déjà en base non remontées par cette collecte..."
+            )
+            avail_updates = check_listings_availability_batch(stale_to_check, max_workers=8)
+            auto_unavail_count, _ = mark_listings_availability_batch(avail_updates)
 
         if reanalyze_existing:
             reset_all_listings_to_pending()
 
         pending_after_scrape = get_pending_listings()
+        unavail_suffix = f" | 🚫 {auto_unavail_count} indisponible(s) masquée(s)" if auto_unavail_count > 0 else ""
         status_box.update(
             label=(
                 f"📥 Collecte terminée : {stats['total']} annonces récupérées "
-                f"({stats.get('seloger', 0)} SeLoger, {stats['bienici_agences']} Bien'ici, {stats['orpi_direct']} Orpi) — "
-                f"{new_count} nouvelles en base. Démarrage du tri parallèle sur {len(pending_after_scrape)} annonces..."
+                f"({stats.get('seloger', 0)} SeLoger, {stats['bienici_agences']} Bien'ici, "
+                f"{stats['orpi_direct']} Orpi, {stats.get('leboncoin', 0)} LeBonCoin) — "
+                f"{new_count} nouvelles + {updated_count} mises à jour en base{unavail_suffix}. "
+                f"Démarrage du tri parallèle sur {len(pending_after_scrape)} annonces..."
             ),
             state="complete",
             expanded=False,
@@ -346,12 +622,12 @@ if launch_search:
     st.session_state["analysis_running"] = True
 
 
-# --- ACTION 2 : EXÉCUTION DE L'ANALYSE IA EN PARALLÈLE ---
+# --- ACTION 2 : EXÉCUTION DE L'ANALYSE IA EN PARALLÈLE (AVEC PRÉ-FILTRAGE HYBRIDE & BATCH SQLITE) ---
 if st.session_state.get("analysis_running") and not st.session_state.get("analysis_paused"):
     pending = get_pending_listings()
     if pending:
         active_key = st.session_state["gemini_api_key"]
-        engine_label = "API Gemini (gemini-3.8-flash)" if active_key else "Moteur de règles local (sans clé API)"
+        engine_label = "Pipeline Hybride (Pré-filtre + Gemini 4 Hydrogen)" if active_key else "Moteur de règles local (sans clé API)"
         total_to_process = len(pending)
 
         info_col, stop_inline_col = st.columns([4, 1])
@@ -367,17 +643,23 @@ if st.session_state.get("analysis_running") and not st.session_state.get("analys
                 st.rerun()
 
         completed_counter = [0]
+        pending_db_updates: List[Tuple[int, Dict[str, Any]]] = []
+        ui_refresh_step = max(1, min(25, total_to_process // 30))
 
         def on_item_completed(item: Dict[str, Any], analysis: Dict[str, Any], count: int, total: int):
-            update_listing_analysis(item["id"], analysis)
+            pending_db_updates.append((item["id"], analysis))
             completed_counter[0] = count
-            progress_bar.progress(
-                count / max(1, total),
-                text=(
-                    f"🧠 Analyse IA parallèle ({max_workers} threads) : {count} / {total} — "
-                    f"{item.get('city', '')} ({item.get('price', 0):,} €)".replace(",", " ")
-                ),
-            )
+            if len(pending_db_updates) >= 25 or count == total:
+                update_listings_analysis_batch(pending_db_updates)
+                pending_db_updates.clear()
+            if count % ui_refresh_step == 0 or count == total:
+                progress_bar.progress(
+                    count / max(1, total),
+                    text=(
+                        f"🧠 Analyse IA parallèle ({max_workers} threads) : {count} / {total} — "
+                        f"{item.get('city', '')} ({item.get('price', 0):,} €)".replace(",", " ")
+                    ),
+                )
 
         def check_cancelled() -> bool:
             return bool(st.session_state.get("analysis_paused"))
@@ -386,11 +668,15 @@ if st.session_state.get("analysis_running") and not st.session_state.get("analys
             listings=pending,
             criteria=current_criteria,
             api_key=active_key,
-            model_name="gemini-3.8-flash",
+            model_name="gemini-4-hydrogen",
             max_workers=max_workers,
             on_completed=on_item_completed,
             check_cancelled=check_cancelled,
         )
+
+        if pending_db_updates:
+            update_listings_analysis_batch(pending_db_updates)
+            pending_db_updates.clear()
 
         st.session_state["analysis_running"] = False
         st.success(f"✅ Tri IA terminé avec succès ({completed_counter[0]} annonces analysées et enregistrées) !")
@@ -405,31 +691,59 @@ if st.session_state.get("analysis_paused"):
         f"Il reste **{remaining}** annonce(s) en statut *En attente* (cliquez sur **▶️ Reprendre ({remaining})** dans la barre latérale quand vous le souhaitez)."
     )
 
+avail_report = st.session_state.pop("availability_report", None)
+if avail_report:
+    if avail_report["marked_unavailable"] > 0:
+        st.info(
+            f"🔍 **Vérification de disponibilité terminée :** "
+            f"**{avail_report['marked_unavailable']}** annonce(s) détectée(s) comme vendue(s) ou retirée(s) du marché et masquée(s) par défaut "
+            f"(**{avail_report['confirmed_available']}** confirmée(s) en ligne)."
+        )
+    else:
+        st.success(
+            f"✅ **Vérification de disponibilité terminée :** aucune annonce indisponible détectée "
+            f"(**{avail_report['confirmed_available']}** confirmée(s) en ligne)."
+        )
+
+manual_unavail_notice = st.session_state.pop("manual_unavail_notice", None)
+if manual_unavail_notice:
+    st.warning(
+        f"⚠️ **Annonce manuelle enregistrée mais marquée comme indisponible** ({manual_unavail_notice}) "
+        "et masquée par défaut dans le flux actif."
+    )
+
 
 # --- CHARGEMENT DES ANNONCES PAR CATÉGORIE ---
-all_active_listings = get_all_listings(include_quarantined=False)
+all_available_listings = get_all_listings(include_quarantined=False, include_unavailable=False)
+unavailable_listings = get_unavailable_listings()
 selected_listings = get_selected_listings()
 quarantined_listings = get_quarantined_listings()
 
 # --- EN-TÊTE DU COCKPIT ---
 st.title("🏡 Cockpit — Mandataire Immobilier Virtuel (100% Live)")
-api_badge = "🟢 Clé Gemini configurée" if st.session_state["gemini_api_key"] else "⚪ Mode Local (Clé Gemini non renseignée)"
+has_key = bool(st.session_state["gemini_api_key"])
+api_badge = "🟢 Clé Gemini active" if has_key else "⚪ Mode Local (Clé Gemini non renseignée)"
+tx_badge = "🔑 Location" if current_criteria.get("transaction_type") == "rent" else "🏷️ Achat"
+price_suffix = "€/mois" if current_criteria.get("transaction_type") == "rent" else "€"
+rooms_badge = f"{current_criteria.get('min_rooms', 0)}+ p." if current_criteria.get("min_rooms", 0) > 0 else "Toutes pièces"
+beds_badge = f"{current_criteria.get('min_bedrooms', 0)}+ ch." if current_criteria.get("min_bedrooms", 0) > 0 else "Toutes ch."
 st.markdown(
-    f"**{api_badge}** | "
-    f"💰 Budget max : **{current_criteria['max_budget']:,} €** | "
+    f"**{api_badge}** | **{tx_badge}** | "
+    f"💰 Budget max : **{current_criteria['max_budget']:,} {price_suffix}** | "
     f"📐 Surface min : **{current_criteria['min_surface']:g} m²** | "
+    f"🛏️ Pièces/Ch. : **{rooms_badge} / {beds_badge}** | "
     f"🏠 Types : **{', '.join(current_criteria['property_types'])}** | "
     f"📍 Secteurs : **{', '.join(current_criteria['cities'])}** | "
     f"🚗 Parking/Garage : **{'Obligatoire' if current_criteria['require_parking'] else 'Optionnel'}**".replace(",", " ")
 )
 
 # --- INDICATEURS CLÉS (KPIs) ---
-a_visiter_list = [x for x in all_active_listings if x["status"] == "a_visiter"]
-a_verifier_list = [x for x in all_active_listings if x["status"] == "a_verifier"]
-rejete_list = [x for x in all_active_listings if x["status"] == "rejete"]
-pending_list = [x for x in all_active_listings if x["status"] == "pending_analysis"]
+a_visiter_list = [x for x in all_available_listings if x["status"] == "a_visiter"]
+a_verifier_list = [x for x in all_available_listings if x["status"] == "a_verifier"]
+rejete_list = [x for x in all_available_listings if x["status"] == "rejete"]
+pending_list = [x for x in all_available_listings if x["status"] == "pending_analysis"]
 
-col_sel, col1, col2, col3, col4, col5 = st.columns(6)
+col_sel, col1, col2, col3, col4, col5, col6 = st.columns(7)
 col_sel.metric(
     "⭐ Sélectionnées",
     len(selected_listings),
@@ -440,6 +754,11 @@ col2.metric("🟡 À Vérifier", len(a_verifier_list))
 col3.metric("🔴 Rejetées IA (No-Go)", len(rejete_list))
 col4.metric("⏳ En attente", len(pending_list))
 col5.metric(
+    "🚫 Indisponibles",
+    len(unavailable_listings),
+    help="Annonces vendues, sous compromis ou retirées (masquées par défaut)",
+)
+col6.metric(
     "🗑️ Quarantaine",
     len(quarantined_listings),
     help="Annonces supprimées / masquées du flux actif",
@@ -450,7 +769,7 @@ st.divider()
 # --- ONGLETS PRINCIPAUX DU COCKPIT ---
 tab_cockpit, tab_selection, tab_quarantaine, tab_portails, tab_ajout = st.tabs(
     [
-        f"🎯 Annonces du Marché ({len(all_active_listings)})",
+        f"🎯 Annonces du Marché ({len(all_available_listings)})",
         f"⭐ Sélectionnées pour Visites ({len(selected_listings)})",
         f"🗑️ Quarantaine ({len(quarantined_listings)})",
         "🌐 Liens Directs Portails (Bien'ici / Orpi / LeBonCoin / SeLoger)",
@@ -462,17 +781,47 @@ tab_cockpit, tab_selection, tab_quarantaine, tab_portails, tab_ajout = st.tabs(
 # ONGLET 1 : TOUTES LES ANNONCES DU MARCHÉ (TRIÉES PAR L'IA)
 # ==============================================================================
 with tab_cockpit:
-    if not all_active_listings:
+    show_unavailable = False
+    if unavailable_listings:
+        u_col1, u_col2 = st.columns([3, 1.4])
+        with u_col1:
+            show_unavailable = st.checkbox(
+                f"🚫 Afficher aussi les annonces plus disponibles ({len(unavailable_listings)})",
+                value=False,
+                key="show_unavailable_listings",
+                help="Cochez pour revoir les annonces vendues, sous compromis ou retirées du marché.",
+            )
+        with u_col2:
+            if st.button(
+                f"🧹 Masquer en quarantaine ({len(unavailable_listings)})",
+                key="btn_quarantine_unavailable",
+                use_container_width=True,
+                help="Déplace définitivement les annonces indisponibles vers l'onglet Quarantaine.",
+            ):
+                q_cnt = quarantine_unavailable_listings()
+                st.toast(f"🧹 {q_cnt} annonce(s) indisponible(s) déplacée(s) en Quarantaine.", icon="🧹")
+                st.rerun()
+
+    pool_listings = all_available_listings + unavailable_listings if show_unavailable else all_available_listings
+
+    if not all_available_listings and not unavailable_listings:
         st.info(
             "👋 Aucune annonce active en base. Cliquez sur **🚀 Lancer la recherche (Live Scraping)** "
             "dans le panneau de gauche pour extraire les annonces en direct depuis Bien'ici et les agences !"
         )
+    elif not pool_listings:
+        st.warning(
+            f"🚫 Toutes les annonces en base ({len(unavailable_listings)}) sont actuellement marquées comme "
+            "indisponibles / vendues et masquées par défaut. Lancez une nouvelle recherche ou cochez la case ci-dessus pour les afficher."
+        )
     else:
-        f_col1, f_col2, f_col3, f_col4 = st.columns([1.5, 1.5, 1, 1])
+        f_col1, f_col2, f_col3, f_col4, f_col5 = st.columns([1.4, 1.4, 1.2, 0.8, 1])
         with f_col1:
             default_statuses = ["a_visiter", "a_verifier"]
             if pending_list and not a_visiter_list and not a_verifier_list:
                 default_statuses.append("pending_analysis")
+            if show_unavailable and not a_visiter_list and not a_verifier_list and not pending_list:
+                default_statuses.append("rejete")
             status_choice = st.multiselect(
                 "Filtrer par décision IA",
                 options=["a_visiter", "a_verifier", "pending_analysis", "rejete"],
@@ -485,15 +834,21 @@ with tab_cockpit:
                 }.get(s, s),
             )
         with f_col2:
-            available_cities = sorted(list({x["city"] for x in all_active_listings if x.get("city")}))
+            available_cities = sorted(list({x["city"] for x in pool_listings if x.get("city")}))
             city_choice = st.multiselect(
                 "Filtrer par ville",
                 options=available_cities,
                 default=available_cities,
             )
         with f_col3:
-            min_score_filter = st.slider("Score IA min", 0, 10, 0)
+            search_kw = st.text_input(
+                "🔍 Recherche mot-clé",
+                value="",
+                placeholder="Ex: jardin, Barbieux, plain-pied...",
+            ).strip().lower()
         with f_col4:
+            min_score_filter = st.slider("Score IA min", 0, 10, 0)
+        with f_col5:
             selection_filter = st.selectbox(
                 "Filtre sélection",
                 options=["Toutes", "⭐ Sélectionnées uniquement", "Non sélectionnées"],
@@ -501,10 +856,16 @@ with tab_cockpit:
 
         filtered = [
             x
-            for x in all_active_listings
+            for x in pool_listings
             if x["status"] in status_choice
             and (not city_choice or x["city"] in city_choice)
             and (x["ai_score"] is None or x["ai_score"] >= min_score_filter)
+            and (
+                not search_kw
+                or search_kw in (x.get("title") or "").lower()
+                or search_kw in (x.get("description") or "").lower()
+                or search_kw in (x.get("source") or "").lower()
+            )
             and (
                 selection_filter == "Toutes"
                 or (selection_filter == "⭐ Sélectionnées uniquement" and x.get("is_selected"))
@@ -512,18 +873,180 @@ with tab_cockpit:
             )
         ]
 
-        # --- MODULE D'EXPORTATION EXCEL & CSV ---
+        # --- SÉLECTEUR DE MODE D'AFFICHAGE ---
+        view_mode = st.radio(
+            "Mode d'affichage",
+            options=["🃏 Cartes détaillées", "📊 Tableau (type CSV)"],
+            horizontal=True,
+            key="market_view_mode",
+        )
+
+        active_view_listings = filtered
+        selected_columns = DEFAULT_TABLE_COLUMNS
+
+        if view_mode == "📊 Tableau (type CSV)":
+            def _sync_multiselect_state(state_key: str, valid_options: List[str], default_all: bool = True) -> None:
+                if state_key not in st.session_state:
+                    st.session_state[state_key] = list(valid_options) if default_all else []
+                else:
+                    current = st.session_state[state_key]
+                    cleaned = [v for v in current if v in valid_options]
+                    if cleaned != current:
+                        st.session_state[state_key] = cleaned
+
+            with st.expander("🔎 Filtres par colonnes & choix des colonnes", expanded=True):
+                dpe_order = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4, "F": 5, "G": 6}
+                available_types = sorted({str(x.get("property_type") or "") for x in filtered if x.get("property_type")})
+                available_tx = sorted({"Location" if x.get("transaction_type") == "rent" else "Achat" for x in filtered})
+                available_dpes = sorted(
+                    {str(x.get("dpe") or "Non renseigné") for x in filtered},
+                    key=lambda d: (dpe_order.get(d, 99), d),
+                )
+                available_sources = sorted({str(x.get("source") or "") for x in filtered if x.get("source")})
+
+                _sync_multiselect_state("tbl_filter_type", available_types, default_all=True)
+                _sync_multiselect_state("tbl_filter_tx", available_tx, default_all=True)
+                _sync_multiselect_state("tbl_filter_dpe", available_dpes, default_all=True)
+                _sync_multiselect_state("tbl_filter_sources", available_sources, default_all=False)
+                _sync_multiselect_state("tbl_visible_cols", TABLE_COLUMNS, default_all=False)
+                if not st.session_state["tbl_visible_cols"]:
+                    st.session_state["tbl_visible_cols"] = list(DEFAULT_TABLE_COLUMNS)
+
+                r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
+                with r1_c1:
+                    type_choice_tbl = st.multiselect(
+                        "Type de bien",
+                        options=available_types,
+                        key="tbl_filter_type",
+                    )
+                with r1_c2:
+                    tx_choice_tbl = st.multiselect(
+                        "Transaction",
+                        options=available_tx,
+                        key="tbl_filter_tx",
+                    )
+                with r1_c3:
+                    dpe_choice_tbl = st.multiselect(
+                        "DPE",
+                        options=available_dpes,
+                        key="tbl_filter_dpe",
+                    )
+                with r1_c4:
+                    parking_choice_tbl = st.selectbox(
+                        "Parking / Garage",
+                        options=["Tous", "Oui ✅", "Non ❌"],
+                        key="tbl_filter_parking",
+                    )
+
+                r2_c1, r2_c2, r2_c3, r2_c4 = st.columns(4)
+                prices_vals = [int(x.get("price") or 0) for x in filtered]
+                price_range = None
+                with r2_c1:
+                    if prices_vals and max(prices_vals) > min(prices_vals):
+                        min_p, max_p = min(prices_vals), max(prices_vals)
+                        if "tbl_filter_price" not in st.session_state:
+                            st.session_state["tbl_filter_price"] = (min_p, max_p)
+                        else:
+                            lo_p, hi_p = st.session_state["tbl_filter_price"]
+                            lo_p = max(min_p, min(max_p, lo_p))
+                            hi_p = max(lo_p, min(max_p, hi_p))
+                            st.session_state["tbl_filter_price"] = (lo_p, hi_p)
+                        price_range = st.slider(
+                            "Prix (€)",
+                            min_value=min_p,
+                            max_value=max_p,
+                            key="tbl_filter_price",
+                        )
+                    elif prices_vals:
+                        st.caption(f"Prix unique : {prices_vals[0]:,} €".replace(",", " "))
+
+                surface_vals = [float(x.get("surface") or 0.0) for x in filtered]
+                surface_range = None
+                with r2_c2:
+                    if surface_vals:
+                        min_s = int(min(surface_vals))
+                        max_s = int(max(surface_vals)) + (1 if max(surface_vals) % 1 else 0)
+                        if max_s > min_s:
+                            if "tbl_filter_surface" not in st.session_state:
+                                st.session_state["tbl_filter_surface"] = (min_s, max_s)
+                            else:
+                                lo_s, hi_s = st.session_state["tbl_filter_surface"]
+                                lo_s = max(min_s, min(max_s, lo_s))
+                                hi_s = max(lo_s, min(max_s, hi_s))
+                                st.session_state["tbl_filter_surface"] = (lo_s, hi_s)
+                            surface_range = st.slider(
+                                "Surface (m²)",
+                                min_value=min_s,
+                                max_value=max_s,
+                                key="tbl_filter_surface",
+                            )
+                        else:
+                            st.caption(f"Surface unique : {min_s} m²")
+
+                with r2_c3:
+                    min_rooms_tbl = st.number_input(
+                        "Pièces min",
+                        min_value=0,
+                        max_value=20,
+                        value=0,
+                        step=1,
+                        key="tbl_filter_rooms",
+                    )
+                with r2_c4:
+                    min_beds_tbl = st.number_input(
+                        "Chambres min",
+                        min_value=0,
+                        max_value=15,
+                        value=0,
+                        step=1,
+                        key="tbl_filter_beds",
+                    )
+
+                r3_c1, r3_c2 = st.columns(2)
+                with r3_c1:
+                    source_choice_tbl = st.multiselect(
+                        "Source / Agence",
+                        options=available_sources,
+                        placeholder="Toutes les sources...",
+                        key="tbl_filter_sources",
+                    )
+                with r3_c2:
+                    selected_columns = st.multiselect(
+                        "Colonnes affichées",
+                        options=TABLE_COLUMNS,
+                        key="tbl_visible_cols",
+                    )
+
+            active_view_listings = [
+                x
+                for x in filtered
+                if (not available_types or str(x.get("property_type") or "") in type_choice_tbl)
+                and (not available_tx or ("Location" if x.get("transaction_type") == "rent" else "Achat") in tx_choice_tbl)
+                and (not available_dpes or str(x.get("dpe") or "Non renseigné") in dpe_choice_tbl)
+                and (
+                    parking_choice_tbl == "Tous"
+                    or (parking_choice_tbl == "Oui ✅" and bool(x.get("has_parking")))
+                    or (parking_choice_tbl == "Non ❌" and not bool(x.get("has_parking")))
+                )
+                and (price_range is None or price_range[0] <= int(x.get("price") or 0) <= price_range[1])
+                and (surface_range is None or surface_range[0] <= float(x.get("surface") or 0.0) <= surface_range[1])
+                and (min_rooms_tbl == 0 or int(x.get("rooms") or 0) >= min_rooms_tbl)
+                and (min_beds_tbl == 0 or int(x.get("bedrooms") or 0) >= min_beds_tbl)
+                and (not source_choice_tbl or str(x.get("source") or "") in source_choice_tbl)
+            ]
+
+        # --- MODULE D'EXPORTATION EXCEL & CSV (GÉNÉRATION À LA DEMANDE POUR NE PAS RALENTIR LE RENDU) ---
         with st.expander("📥 Exporter les données (Excel .xlsx / CSV France)", expanded=False):
-            exp_col1, exp_col2 = st.columns(2)
+            exp_col1, exp_col2 = st.columns([2, 1])
             with exp_col1:
                 scope_choice = st.radio(
                     "Périmètre de l'export :",
                     options=["selection_user", "filtres_actifs", "pepites", "tout"],
                     format_func=lambda k: {
                         "selection_user": f"⭐ Annonces sélectionnées pour visites ({len(selected_listings)} annonces)",
-                        "filtres_actifs": f"🎯 Filtres actuels ({len(filtered)} annonces)",
+                        "filtres_actifs": f"🎯 Filtres actuels ({len(active_view_listings)} annonces)",
                         "pepites": f"💡 Opportunités retenues IA ({len(a_visiter_list) + len(a_verifier_list)} annonces)",
-                        "tout": f"📁 Marché actif ({len(all_active_listings)} annonces)",
+                        "tout": f"📁 Marché disponible ({len(all_available_listings)} annonces)",
                     }.get(k, k),
                     horizontal=True,
                 )
@@ -531,117 +1054,260 @@ with tab_cockpit:
             if scope_choice == "selection_user":
                 export_pool = selected_listings
             elif scope_choice == "filtres_actifs":
-                export_pool = filtered
+                export_pool = active_view_listings
             elif scope_choice == "pepites":
-                export_pool = [x for x in all_active_listings if x["status"] in ("a_visiter", "a_verifier")]
+                export_pool = [x for x in all_available_listings if x["status"] in ("a_visiter", "a_verifier")]
             else:
-                export_pool = all_active_listings
+                export_pool = all_available_listings
 
-            if export_pool:
-                csv_bytes, excel_bytes = generate_export_files(export_pool)
-                timestamp_str = datetime.now().strftime("%Y%m%d_%H%M")
-                with exp_col2:
-                    st.write("")
-                    dl_col1, dl_col2 = st.columns(2)
-                    with dl_col1:
-                        st.download_button(
-                            label="📊 Exporter en Excel (.xlsx)",
-                            data=excel_bytes,
-                            file_name=f"mandataire_immo_{scope_choice}_{timestamp_str}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True,
-                        )
-                    with dl_col2:
-                        st.download_button(
-                            label="📄 Exporter en CSV (Excel FR)",
-                            data=csv_bytes,
-                            file_name=f"mandataire_immo_{scope_choice}_{timestamp_str}.csv",
-                            mime="text/csv",
-                            use_container_width=True,
-                        )
-            else:
-                st.caption("Aucune annonce à exporter pour ce périmètre.")
+            with exp_col2:
+                if export_pool:
+                    if st.button("⚙️ Préparer les fichiers d'export (.xlsx & .csv)", use_container_width=True):
+                        csv_b, excel_b = generate_export_files(export_pool)
+                        st.session_state["ready_export_csv"] = csv_b
+                        st.session_state["ready_export_xlsx"] = excel_b
+                        st.session_state["ready_export_scope"] = scope_choice
+                        st.session_state["ready_export_ts"] = datetime.now().strftime("%Y%m%d_%H%M")
 
-        st.caption(f"Affichage de **{len(filtered)}** annonce(s) sur {len(all_active_listings)} en base active.")
+                    if st.session_state.get("ready_export_scope") == scope_choice and st.session_state.get("ready_export_xlsx"):
+                        ts = st.session_state["ready_export_ts"]
+                        dl_col1, dl_col2 = st.columns(2)
+                        with dl_col1:
+                            st.download_button(
+                                label="📊 Télécharger Excel (.xlsx)",
+                                data=st.session_state["ready_export_xlsx"],
+                                file_name=f"mandataire_immo_{scope_choice}_{ts}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                use_container_width=True,
+                            )
+                        with dl_col2:
+                            st.download_button(
+                                label="📄 Télécharger CSV (FR)",
+                                data=st.session_state["ready_export_csv"],
+                                file_name=f"mandataire_immo_{scope_choice}_{ts}.csv",
+                                mime="text/csv",
+                                use_container_width=True,
+                            )
+                else:
+                    st.caption("Aucune annonce à exporter pour ce périmètre.")
 
-        for ad in filtered:
-            score = ad.get("ai_score") or 0
-            status = ad.get("status")
-            if status == "a_visiter":
-                badge = f"🟢 **À VISITER** — Score IA : **{score}/10**"
-            elif status == "a_verifier":
-                badge = f"🟡 **À VÉRIFIER** — Score IA : **{score}/10**"
-            elif status == "pending_analysis":
-                badge = "⏳ **EN ATTENTE D'ANALYSE IA**"
-            else:
-                badge = f"🔴 **REJETÉ** — Score IA : **{score}/10**"
+        if view_mode == "📊 Tableau (type CSV)":
+            st.caption(
+                f"Affichage de **{len(active_view_listings)}** annonce(s) — "
+                "Cliquez sur l'en-tête d'une colonne pour trier, utilisez la loupe du tableau pour rechercher, "
+                "ou cochez des lignes pour agir dessus."
+            )
+            df_table = build_table_dataframe(active_view_listings)
+            event = st.dataframe(
+                df_table,
+                width="stretch",
+                height=620,
+                hide_index=True,
+                column_order=selected_columns if selected_columns else None,
+                on_select="rerun",
+                selection_mode="multi-row",
+                key="market_table_df",
+                column_config={
+                    "Score IA": st.column_config.ProgressColumn("Score IA", min_value=0, max_value=10, format="%d/10"),
+                    "Prix (€)": st.column_config.NumberColumn("Prix (€)", format="%d €"),
+                    "Surface (m²)": st.column_config.NumberColumn("Surface (m²)", format="%.0f m²"),
+                    "Prix/m² (€)": st.column_config.NumberColumn("Prix/m² (€)", format="%.0f €/m²"),
+                    "Sélectionné": st.column_config.CheckboxColumn("⭐"),
+                    "Parking": st.column_config.CheckboxColumn("🚗"),
+                    "URL": st.column_config.LinkColumn("Annonce", display_text="🔗 Ouvrir"),
+                },
+            )
 
-            with st.container(border=True):
-                top_left, top_right = st.columns([4, 1])
-                with top_left:
-                    sel_pill = " &nbsp;|&nbsp; 🌟 **SÉLECTIONNÉE**" if ad.get("is_selected") else ""
-                    st.markdown(f"### {ad['title']}")
-                    st.markdown(
-                        f"{badge}{sel_pill} &nbsp;|&nbsp; 📍 **{ad['city']} ({ad['postal_code']})** &nbsp;|&nbsp; "
-                        f"🏢 **{ad['source']}** &nbsp;|&nbsp; "
-                        f"🏠 **{ad['property_type']}** ({ad.get('rooms', '?')} p.) &nbsp;|&nbsp; "
-                        f"🔋 DPE : **`{ad.get('dpe', 'N/C')}`** &nbsp;|&nbsp; "
-                        f"🚗 Parking/Garage : **{'Oui ✅' if ad.get('has_parking') else 'Non ❌'}**"
-                    )
-                with top_right:
-                    st.metric(
-                        label=f"{ad['surface']:g} m²",
-                        value=f"{ad['price']:,} €".replace(",", " "),
-                        delta=f"{ad.get('price_per_m2', 0):,.0f} €/m²".replace(",", " "),
-                        delta_color="off",
-                    )
-
-                if ad.get("ai_rejection_reason"):
-                    st.error(f"🚫 **Motif d'exclusion :** {ad['ai_rejection_reason']}")
-                elif ad.get("ai_summary"):
-                    st.info(f"💡 **Avis du Mandataire IA :** {ad['ai_summary']}")
-
-                c_pros, c_cons = st.columns(2)
-                with c_pros:
-                    if ad.get("ai_pros"):
-                        st.markdown("**✅ Points forts :**")
-                        for p in ad["ai_pros"]:
-                            st.markdown(f"- {p}")
-                with c_cons:
-                    if ad.get("ai_cons") or ad.get("ai_signals"):
-                        st.markdown("**⚠️ Vigilance & Signaux :**")
-                        for c in (ad.get("ai_cons") or []) + (ad.get("ai_signals") or []):
-                            st.markdown(f"- {c}")
-
-                # Ligne des boutons d'action
-                act_col1, act_col2, act_col3 = st.columns([2, 1.5, 1.5])
-                with act_col1:
-                    st.link_button(
-                        "🔗 Ouvrir l'annonce réelle",
-                        url=ad["url"],
+            selected_row_indices = (
+                [idx for idx in event.selection.rows if 0 <= idx < len(active_view_listings)]
+                if event and getattr(event, "selection", None)
+                else []
+            )
+            if selected_row_indices:
+                n_sel = len(selected_row_indices)
+                t_act1, t_act2, t_act3 = st.columns(3)
+                with t_act1:
+                    if st.button(
+                        f"⭐ Ajouter à ma sélection ({n_sel})",
+                        key="tbl_bulk_sel",
+                        type="primary",
                         use_container_width=True,
-                    )
-                with act_col2:
-                    if ad.get("is_selected"):
-                        if st.button("⭐ Sélectionnée (Retirer)", key=f"unsel_main_{ad['id']}", use_container_width=True):
-                            set_listing_selection(ad["id"], False)
-                            st.toast("Annonce retirée de la sélection.", icon="ℹ️")
-                            st.rerun()
-                    else:
-                        if st.button("⭐ Sélectionner", key=f"sel_main_{ad['id']}", type="primary", use_container_width=True):
-                            def_agency = extract_default_agency_name(ad.get("source", ""))
-                            def_phone = extract_phone_number(ad.get("description", ""))
-                            set_listing_selection(ad["id"], True, default_agency_name=def_agency, default_phone=def_phone)
-                            st.toast("⭐ Annonce ajoutée à vos annonces sélectionnées !", icon="⭐")
-                            st.rerun()
-                with act_col3:
-                    if st.button("🗑️ Supprimer", key=f"del_main_{ad['id']}", help="Masquer de la sélection et déplacer en Quarantaine", use_container_width=True):
-                        set_listing_quarantine(ad["id"], True)
-                        st.toast("🗑️ Annonce déplacée en Quarantaine (masquée).", icon="🗑️")
+                    ):
+                        for idx in selected_row_indices:
+                            ad_item = active_view_listings[idx]
+                            def_agency = extract_default_agency_name(ad_item.get("source", ""))
+                            def_phone = extract_phone_number(ad_item.get("description", ""))
+                            set_listing_selection(ad_item["id"], True, default_agency_name=def_agency, default_phone=def_phone)
+                        st.toast(f"⭐ {n_sel} annonce(s) ajoutée(s) à votre sélection !", icon="⭐")
+                        st.rerun()
+                with t_act2:
+                    if st.button(
+                        f"❌ Retirer de ma sélection ({n_sel})",
+                        key="tbl_bulk_unsel",
+                        use_container_width=True,
+                    ):
+                        for idx in selected_row_indices:
+                            set_listing_selection(active_view_listings[idx]["id"], False)
+                        st.toast(f"{n_sel} annonce(s) retirée(s) de la sélection.", icon="ℹ️")
+                        st.rerun()
+                with t_act3:
+                    if st.button(
+                        f"🗑️ Mettre en quarantaine ({n_sel})",
+                        key="tbl_bulk_quar",
+                        use_container_width=True,
+                    ):
+                        for idx in selected_row_indices:
+                            set_listing_quarantine(active_view_listings[idx]["id"], True)
+                        st.session_state.pop("market_table_df", None)
+                        st.toast(f"🗑️ {n_sel} annonce(s) déplacée(s) en Quarantaine.", icon="🗑️")
                         st.rerun()
 
-                with st.expander("📄 Lire la description complète de l'annonce"):
-                    st.write(ad["description"])
+                if n_sel == 1:
+                    ad_detail = active_view_listings[selected_row_indices[0]]
+                    with st.expander("📄 Aperçu détaillé de l'annonce sélectionnée", expanded=True):
+                        st.markdown(f"#### {_safe_md_text(ad_detail.get('title', ''))}")
+                        st.link_button("🔗 Ouvrir l'annonce réelle", url=ad_detail["url"])
+                        if not ad_detail.get("is_available", True):
+                            st.error(
+                                f"🚫 **Annonce plus disponible** : "
+                                f"{ad_detail.get('unavailable_reason') or 'Bien vendu, sous compromis ou retiré du marché'}"
+                            )
+                        if ad_detail.get("ai_rejection_reason"):
+                            st.error(f"🚫 **Motif d'exclusion :** {ad_detail['ai_rejection_reason']}")
+                        elif ad_detail.get("ai_summary"):
+                            st.info(f"💡 **Avis du Mandataire IA :** {ad_detail['ai_summary']}")
+                        d_pros, d_cons = st.columns(2)
+                        with d_pros:
+                            if ad_detail.get("ai_pros"):
+                                st.markdown("**✅ Points forts :**")
+                                for p in ad_detail["ai_pros"]:
+                                    st.markdown(f"- {p}")
+                        with d_cons:
+                            if ad_detail.get("ai_cons") or ad_detail.get("ai_signals"):
+                                st.markdown("**⚠️ Vigilance & Signaux :**")
+                                for c in (ad_detail.get("ai_cons") or []) + (ad_detail.get("ai_signals") or []):
+                                    st.markdown(f"- {c}")
+                        st.markdown("**📝 Description complète :**")
+                        st.write(ad_detail.get("description") or "")
+        else:
+            # --- PAGINATION HAUTE PERFORMANCE DU DOM STREAMLIT ---
+            total_filtered = len(active_view_listings)
+            p_col1, p_col2, p_col3 = st.columns([2, 1, 1])
+            with p_col2:
+                page_size = st.selectbox(
+                    "Annonces par page",
+                    options=[25, 50, 100],
+                    index=0,
+                    key="market_page_size",
+                )
+            total_pages = max(1, (total_filtered + page_size - 1) // page_size)
+            with p_col3:
+                current_page = st.number_input(
+                    f"Page (sur {total_pages})",
+                    min_value=1,
+                    max_value=total_pages,
+                    value=1,
+                    step=1,
+                    key="market_page_num",
+                )
+            start_idx = (current_page - 1) * page_size
+            end_idx = min(total_filtered, start_idx + page_size)
+            paginated_ads = active_view_listings[start_idx:end_idx]
+
+            with p_col1:
+                st.caption(
+                    f"Affichage des annonces **{start_idx + 1 if total_filtered else 0} à {end_idx}** "
+                    f"sur **{total_filtered}** filtrée(s) ({len(all_available_listings)} disponible(s) en base)."
+                )
+
+            for ad in paginated_ads:
+                score = ad.get("ai_score") or 0
+                status = ad.get("status")
+                if status == "a_visiter":
+                    badge = f"🟢 **À VISITER** — Score IA : **{score}/10**"
+                elif status == "a_verifier":
+                    badge = f"🟡 **À VÉRIFIER** — Score IA : **{score}/10**"
+                elif status == "pending_analysis":
+                    badge = "⏳ **EN ATTENTE D'ANALYSE IA**"
+                else:
+                    badge = f"🔴 **REJETÉ** — Score IA : **{score}/10**"
+
+                with st.container(border=True):
+                    top_left, top_right = st.columns([4, 1])
+                    with top_left:
+                        sel_pill = " &nbsp;|&nbsp; 🌟 **SÉLECTIONNÉE**" if ad.get("is_selected") else ""
+                        tx_pill = "🔑 Location" if ad.get("transaction_type") == "rent" else "🏷️ Achat"
+                        beds_str = f", {ad.get('bedrooms')} ch." if ad.get("bedrooms") else ""
+                        safe_title = _safe_md_text(ad.get("title", ""))
+                        safe_source = _safe_md_text(ad.get("source", ""))
+                        st.markdown(f"### {safe_title}")
+                        st.markdown(
+                            f"{badge}{sel_pill} &nbsp;|&nbsp; **{tx_pill}** &nbsp;|&nbsp; 📍 **{ad['city']} ({ad['postal_code']})** &nbsp;|&nbsp; "
+                            f"🏢 **{safe_source}** &nbsp;|&nbsp; "
+                            f"🏠 **{ad['property_type']}** ({ad.get('rooms', '?')} p.{beds_str}) &nbsp;|&nbsp; "
+                            f"🔋 DPE : **`{ad.get('dpe', 'N/C')}`** &nbsp;|&nbsp; "
+                            f"🚗 Parking/Garage : **{'Oui ✅' if ad.get('has_parking') else 'Non ❌'}**"
+                        )
+                    with top_right:
+                        st.metric(
+                            label=f"{ad['surface']:g} m²",
+                            value=f"{ad['price']:,} €".replace(",", " "),
+                            delta=f"{ad.get('price_per_m2', 0):,.0f} €/m²".replace(",", " "),
+                            delta_color="off",
+                        )
+
+                    if not ad.get("is_available", True):
+                        st.error(
+                            f"🚫 **Annonce plus disponible** : "
+                            f"{ad.get('unavailable_reason') or 'Bien vendu, sous compromis ou retiré du marché'}"
+                        )
+
+                    if ad.get("ai_rejection_reason"):
+                        st.error(f"🚫 **Motif d'exclusion :** {ad['ai_rejection_reason']}")
+                    elif ad.get("ai_summary"):
+                        st.info(f"💡 **Avis du Mandataire IA :** {ad['ai_summary']}")
+
+                    c_pros, c_cons = st.columns(2)
+                    with c_pros:
+                        if ad.get("ai_pros"):
+                            st.markdown("**✅ Points forts :**")
+                            for p in ad["ai_pros"]:
+                                st.markdown(f"- {p}")
+                    with c_cons:
+                        if ad.get("ai_cons") or ad.get("ai_signals"):
+                            st.markdown("**⚠️ Vigilance & Signaux :**")
+                            for c in (ad.get("ai_cons") or []) + (ad.get("ai_signals") or []):
+                                st.markdown(f"- {c}")
+
+                    # Ligne des boutons d'action
+                    act_col1, act_col2, act_col3 = st.columns([2, 1.5, 1.5])
+                    with act_col1:
+                        st.link_button(
+                            "🔗 Ouvrir l'annonce réelle",
+                            url=ad["url"],
+                            use_container_width=True,
+                        )
+                    with act_col2:
+                        if ad.get("is_selected"):
+                            if st.button("⭐ Sélectionnée (Retirer)", key=f"unsel_main_{ad['id']}", use_container_width=True):
+                                set_listing_selection(ad["id"], False)
+                                st.toast("Annonce retirée de la sélection.", icon="ℹ️")
+                                st.rerun()
+                        else:
+                            if st.button("⭐ Sélectionner", key=f"sel_main_{ad['id']}", type="primary", use_container_width=True):
+                                def_agency = extract_default_agency_name(ad.get("source", ""))
+                                def_phone = extract_phone_number(ad.get("description", ""))
+                                set_listing_selection(ad["id"], True, default_agency_name=def_agency, default_phone=def_phone)
+                                st.toast("⭐ Annonce ajoutée à vos annonces sélectionnées !", icon="⭐")
+                                st.rerun()
+                    with act_col3:
+                        if st.button("🗑️ Supprimer", key=f"del_main_{ad['id']}", help="Masquer de la sélection et déplacer en Quarantaine", use_container_width=True):
+                            set_listing_quarantine(ad["id"], True)
+                            st.toast("🗑️ Annonce déplacée en Quarantaine (masquée).", icon="🗑️")
+                            st.rerun()
+
+                    with st.expander("📄 Lire la description complète de l'annonce"):
+                        st.write(ad["description"])
 
 
 # ==============================================================================
@@ -676,15 +1342,21 @@ with tab_selection:
         for ad in selected_listings:
             score = ad.get("ai_score") or 0
             with st.container(border=True):
+                if not ad.get("is_available", True):
+                    st.error(
+                        f"🚫 **Attention : cette annonce n'est plus disponible** "
+                        f"({ad.get('unavailable_reason') or 'Retirée du marché / vendue'})."
+                    )
                 top_left, top_right = st.columns([4, 1])
                 with top_left:
                     st.markdown(f"### ⭐ {ad['title']}")
                     contact_badge = "🟢 Contact pris" if ad.get("contact_made") else "⚪ À contacter"
                     visit_badge = "🗓️ Visite programmée" if ad.get("visit_scheduled") else "⚪ Visite à planifier"
+                    beds_str = f", {ad.get('bedrooms')} ch." if ad.get("bedrooms") else ""
                     st.markdown(
                         f"**{contact_badge}** &nbsp;|&nbsp; **{visit_badge}** &nbsp;|&nbsp; "
                         f"📍 **{ad['city']} ({ad['postal_code']})** &nbsp;|&nbsp; "
-                        f"🏠 **{ad['property_type']}** ({ad.get('rooms', '?')} p.) &nbsp;|&nbsp; "
+                        f"🏠 **{ad['property_type']}** ({ad.get('rooms', '?')} p.{beds_str}) &nbsp;|&nbsp; "
                         f"🔋 DPE : **`{ad.get('dpe', 'N/C')}`** &nbsp;|&nbsp; "
                         f"🚗 Parking/Garage : **{'Oui ✅' if ad.get('has_parking') else 'Non ❌'}**"
                     )
@@ -893,16 +1565,50 @@ with tab_portails:
 
 
 # ==============================================================================
-# ONGLET 5 : TESTER / IMPORTER UNE ANNONCE MANUELLE
+# ONGLET 5 : TESTER / IMPORTER UNE ANNONCE MANUELLE OU UN LOT LEBONCOIN
 # ==============================================================================
 with tab_ajout:
-    st.subheader("➕ Analyser une annonce spécifique (Copier-coller)")
-    st.write("Vous avez repéré une annonce sur LeBonCoin, SeLoger ou en agence ? Soumettez-la au Cerveau IA :")
+    st.subheader("🟠 Import Rapide d'une page de résultats LeBonCoin (Particuliers & Pros)")
+    st.caption(
+        "Si DataDome bloque le scraping direct LeBonCoin, ouvrez une recherche LeBonCoin depuis l'onglet "
+        "**🌐 Liens Directs Portails** dans votre navigateur habituel, affichez le code source de la page (`Ctrl+U`), "
+        "copiez tout (`Ctrl+A` puis `Ctrl+C`) et collez-le ci-dessous : les 35 annonces complètes (avec description, DPE, "
+        "chambres, particulier/pro) seront extraites et analysées par l'IA d'un seul coup !"
+    )
+    with st.form("lbc_bulk_import_form"):
+        lbc_raw_html = st.text_area(
+            "Code source HTML (`Ctrl+U`) ou JSON `__NEXT_DATA__` d'une page LeBonCoin",
+            height=130,
+            placeholder="Collez ici le code source HTML complet de la page de recherche ou d'une annonce LeBonCoin...",
+        )
+        lbc_import_btn = st.form_submit_button("📥 Extraire et analyser toutes les annonces LeBonCoin", type="primary")
+
+    if lbc_import_btn and lbc_raw_html.strip():
+        extracted_lbc = parse_leboncoin_payload(lbc_raw_html, current_criteria)
+        if not extracted_lbc:
+            st.error("Aucune annonce LeBonCoin correspondant à vos critères n'a été détectée dans ce contenu (vérifiez qu'il contient bien la balise `__NEXT_DATA__`).")
+        else:
+            added_lbc, updated_lbc = upsert_listings_batch(extracted_lbc)
+            st.success(
+                f"✅ {len(extracted_lbc)} annonce(s) LeBonCoin extraite(s) ({added_lbc} nouvelles, {updated_lbc} mises à jour) ! "
+                "Lancement de l'analyse IA..."
+            )
+            st.session_state["analysis_running"] = True
+            st.rerun()
+
+    st.divider()
+    st.subheader("➕ Analyser une annonce unitaire (Copier-coller)")
+    st.write("Vous avez repéré une annonce spécifique ? Soumettez-la au Cerveau IA :")
 
     with st.form("manual_ad_form"):
         m_col1, m_col2 = st.columns(2)
         with m_col1:
             m_title = st.text_input("Titre de l'annonce", placeholder="Ex: Maison 95m² avec garage - Wasquehal")
+            m_tx = st.selectbox(
+                "Transaction",
+                options=["Achat", "Location"],
+                index=1 if current_criteria.get("transaction_type") == "rent" else 0,
+            )
             m_city = st.selectbox(
                 "Ville",
                 options=current_criteria.get("cities", list(CITY_METADATA.keys())) + ["Autre commune"],
@@ -910,8 +1616,13 @@ with tab_ajout:
             m_type = st.selectbox("Type de bien", options=["Maison", "Appartement"])
             m_url = st.text_input("URL de l'annonce (optionnel)", placeholder="https://www.leboncoin.fr/...")
         with m_col2:
-            m_price = st.number_input("Prix FAI (€)", min_value=10000, max_value=2000000, value=265000, step=1000)
+            m_price = st.number_input("Prix / Loyer (€)", min_value=200, max_value=3000000, value=1200 if current_criteria.get("transaction_type") == "rent" else 265000, step=100)
             m_surface = st.number_input("Surface (m²)", min_value=15.0, max_value=500.0, value=90.0, step=1.0)
+            mr_col1, mr_col2 = st.columns(2)
+            with mr_col1:
+                m_rooms = st.number_input("Nombre de pièces", min_value=1, max_value=15, value=4, step=1)
+            with mr_col2:
+                m_bedrooms = st.number_input("Nombre de chambres", min_value=0, max_value=12, value=3, step=1)
             m_dpe = st.selectbox("DPE affiché", options=["Non renseigné", "A", "B", "C", "D", "E", "F", "G"])
             m_parking = st.checkbox("Parking / Garage mentionné", value=True)
 
@@ -924,25 +1635,34 @@ with tab_ajout:
 
     if submit_manual and m_title and m_desc:
         ext_id = "manual-" + hashlib.md5(f"{m_title}-{m_price}-{m_surface}".encode("utf-8")).hexdigest()[:10]
+        tx_val = "rent" if m_tx == "Location" else "buy"
+        manual_unavail = detect_unavailable_reason(m_title.strip(), m_desc.strip(), tx_type=tx_val)
         ad_obj = {
             "external_id": ext_id,
             "source": "Ajout Manuel",
             "url": m_url.strip() or f"https://localhost/manual/{ext_id}",
             "title": m_title.strip(),
+            "transaction_type": tx_val,
             "property_type": m_type,
             "price": int(m_price),
             "surface": float(m_surface),
-            "rooms": 4,
+            "rooms": int(m_rooms),
+            "bedrooms": int(m_bedrooms),
             "city": m_city,
             "postal_code": CITY_METADATA.get(m_city, {}).get("postal_code", "59000"),
             "description": m_desc.strip(),
             "dpe": m_dpe,
             "has_parking": m_parking,
+            "is_available": manual_unavail is None,
+            "unavailable_reason": manual_unavail or "",
         }
         upsert_listing(ad_obj)
         pending = get_pending_listings()
         for p in pending:
             res = analyze_listing(p, current_criteria, api_key=st.session_state["gemini_api_key"])
             update_listing_analysis(p["id"], res)
-        st.success("✅ Annonce analysée et ajoutée au tableau de bord !")
+        if manual_unavail:
+            st.session_state["manual_unavail_notice"] = manual_unavail
+        else:
+            st.success("✅ Annonce analysée et ajoutée au tableau de bord !")
         st.rerun()
