@@ -2,7 +2,7 @@ import json
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from scraper import _canonical_city_name
+from scraper import _canonical_city_name, _city_matches_targets
 
 DB_PATH = Path(__file__).parent / "mandataire.db"
 INIT_SQL_PATH = Path(__file__).parent / "init.sql"
@@ -590,6 +590,77 @@ def delete_unavailable_listings() -> int:
         cur = conn.execute("DELETE FROM listings WHERE is_available = 0 AND is_quarantined = 0")
         conn.commit()
         return cur.rowcount
+
+
+def listing_matches_search_criteria(listing: Dict[str, Any], criteria: Dict[str, Any]) -> bool:
+    """Vérifie si une annonce en base respecte toujours les critères structurels de recherche actifs."""
+    criteria_tx = (
+        "rent" if str(criteria.get("transaction_type", "buy")).strip().lower() in ("rent", "location") else "buy"
+    )
+    listing_tx = (
+        "rent" if str(listing.get("transaction_type") or "buy").strip().lower() in ("rent", "location") else "buy"
+    )
+    if listing_tx != criteria_tx:
+        return False
+
+    max_budget = int(criteria.get("max_budget", 1500 if criteria_tx == "rent" else 280000))
+    if int(listing.get("price") or 0) > max_budget:
+        return False
+
+    min_surface = float(criteria.get("min_surface", 80.0))
+    if float(listing.get("surface") or 0.0) < min_surface:
+        return False
+
+    min_rooms = int(criteria.get("min_rooms", 0) or 0)
+    rooms = int(listing.get("rooms") or 0)
+    if min_rooms > 0 and rooms > 0 and rooms < min_rooms:
+        return False
+
+    min_bedrooms = int(criteria.get("min_bedrooms", 0) or 0)
+    bedrooms = int(listing.get("bedrooms") or 0)
+    if min_bedrooms > 0 and bedrooms > 0 and bedrooms < min_bedrooms:
+        return False
+
+    allowed_types = {str(t).strip().lower() for t in (criteria.get("property_types") or []) if str(t).strip()}
+    if allowed_types and str(listing.get("property_type") or "").strip().lower() not in allowed_types:
+        return False
+
+    target_cities = [str(c).strip() for c in (criteria.get("cities") or []) if str(c).strip()]
+    if target_cities and not _city_matches_targets(str(listing.get("city") or "").strip(), target_cities):
+        return False
+
+    return True
+
+
+def prune_listings_not_matching_criteria(criteria: Dict[str, Any], preserve_selected: bool = True) -> int:
+    """
+    Supprime de la base les annonces qui ne correspondent plus aux critères de recherche actifs
+    (transaction, budget max, surface min, pièces/chambres min si renseignées, type de bien, villes).
+    Par défaut, préserve les annonces sélectionnées pour le suivi CRM (`is_selected = 1`).
+    """
+    init_db()
+    with get_connection() as conn:
+        query = "SELECT id, transaction_type, property_type, price, surface, rooms, bedrooms, city FROM listings"
+        if preserve_selected:
+            query += " WHERE is_selected = 0"
+        rows = conn.execute(query).fetchall()
+
+        ids_to_delete = [
+            (int(row["id"]),)
+            for row in rows
+            if not listing_matches_search_criteria(dict(row), criteria)
+        ]
+        if not ids_to_delete:
+            return 0
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.executemany("DELETE FROM listings WHERE id = ?", ids_to_delete)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return len(ids_to_delete)
 
 
 def get_selected_listings() -> List[Dict[str, Any]]:

@@ -24,6 +24,7 @@ from database import (
     import_db_from_json,
     init_db,
     mark_listings_availability_batch,
+    prune_listings_not_matching_criteria,
     quarantine_unavailable_listings,
     reset_all_listings_to_pending,
     restore_all_quarantine,
@@ -565,25 +566,25 @@ if launch_search:
     )
     current_criteria = get_criteria()
 
-    with st.status("🔍 Collecte Live Parallèle (SeLoger + Bien'ici + Orpi + LeBonCoin)...", expanded=True) as status_box:
+    with st.status("🔍 Collecte Live Parallèle (Bien'ici + Orpi)...", expanded=True) as status_box:
         st.write(
-            f"1️⃣ Interrogation simultanée sur 4 threads de **SeLoger.com**, **Bien'ici**, "
-            f"**Orpi** et **LeBonCoin** sur : **{', '.join(parsed_cities)}**..."
+            f"1️⃣ Interrogation simultanée sur 2 threads de **Bien'ici** et **Orpi** "
+            f"sur : **{', '.join(parsed_cities)}**..."
         )
         orpi_cache = get_existing_orpi_descriptions()
         scrape_report = scrape_all_live_sources(current_criteria, existing_orpi_cache=orpi_cache)
         all_fetched = scrape_report["ads"]
         stats = scrape_report["stats"]
 
-        if stats.get("leboncoin_blocked"):
-            st.warning(
-                "⚠️ **LeBonCoin a présenté un portail anti-bot (DataDome 403).** "
-                "Pour importer les annonces LeBonCoin (Particuliers & Pros) en 1 clic, ouvrez le lien de recherche LeBonCoin "
-                "dans votre navigateur (onglet *🌐 Liens Directs Portails*), faites `Ctrl+U` (Code source) et collez-le dans "
-                "l'onglet *➕ Tester / Importer une Annonce* (ou renseignez `LEBONCOIN_COOKIE` dans `.env`)."
-            )
-
         new_count, updated_count = upsert_listings_batch(all_fetched)
+
+        # Nettoyage automatique de la BDD : suppression des annonces hors nouveaux critères (sélections conservées)
+        pruned_count = prune_listings_not_matching_criteria(current_criteria, preserve_selected=True)
+        if pruned_count > 0:
+            st.write(
+                f"2️⃣ Nettoyage BDD : **{pruned_count}** annonce(s) ne correspondant plus aux critères "
+                "supprimée(s) (sélections conservées)."
+            )
 
         # Vérification automatique de disponibilité sur les annonces déjà en base absentes de ce scraping
         fresh_ext_ids = {ad["external_id"] for ad in all_fetched}
@@ -596,8 +597,9 @@ if launch_search:
         stale_to_check = stale_candidates[:200]
         auto_unavail_count = 0
         if stale_to_check:
+            avail_step_icon = "3️⃣" if pruned_count > 0 else "2️⃣"
             st.write(
-                f"2️⃣ Vérification de disponibilité en direct sur **{len(stale_to_check)}** annonce(s) "
+                f"{avail_step_icon} Vérification de disponibilité en direct sur **{len(stale_to_check)}** annonce(s) "
                 "déjà en base non remontées par cette collecte..."
             )
             avail_updates = check_listings_availability_batch(stale_to_check, max_workers=8)
@@ -607,13 +609,13 @@ if launch_search:
             reset_all_listings_to_pending()
 
         pending_after_scrape = get_pending_listings()
+        pruned_suffix = f" | 🧹 {pruned_count} hors critères supprimée(s)" if pruned_count > 0 else ""
         unavail_suffix = f" | 🚫 {auto_unavail_count} indisponible(s) masquée(s)" if auto_unavail_count > 0 else ""
         status_box.update(
             label=(
                 f"📥 Collecte terminée : {stats['total']} annonces récupérées "
-                f"({stats.get('seloger', 0)} SeLoger, {stats['bienici_agences']} Bien'ici, "
-                f"{stats['orpi_direct']} Orpi, {stats.get('leboncoin', 0)} LeBonCoin) — "
-                f"{new_count} nouvelles + {updated_count} mises à jour en base{unavail_suffix}. "
+                f"({stats['bienici_agences']} Bien'ici, {stats['orpi_direct']} Orpi) — "
+                f"{new_count} nouvelles + {updated_count} mises à jour en base{pruned_suffix}{unavail_suffix}. "
                 f"Démarrage du tri parallèle sur {len(pending_after_scrape)} annonces..."
             ),
             state="complete",
@@ -1570,7 +1572,7 @@ with tab_portails:
 with tab_ajout:
     st.subheader("🟠 Import Rapide d'une page de résultats LeBonCoin (Particuliers & Pros)")
     st.caption(
-        "Si DataDome bloque le scraping direct LeBonCoin, ouvrez une recherche LeBonCoin depuis l'onglet "
+        "Pour importer manuellement des annonces LeBonCoin sans scraping automatique, ouvrez une recherche LeBonCoin depuis l'onglet "
         "**🌐 Liens Directs Portails** dans votre navigateur habituel, affichez le code source de la page (`Ctrl+U`), "
         "copiez tout (`Ctrl+A` puis `Ctrl+C`) et collez-le ci-dessous : les 35 annonces complètes (avec description, DPE, "
         "chambres, particulier/pro) seront extraites et analysées par l'IA d'un seul coup !"

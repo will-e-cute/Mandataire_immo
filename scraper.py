@@ -1,8 +1,6 @@
 import concurrent.futures
 import difflib
-import hashlib
 import json
-import os
 import random
 import re
 import threading
@@ -206,7 +204,7 @@ ROTATING_USER_AGENTS = [
 def get_browser_headers(accept_json: bool = False) -> Dict[str, str]:
     """
     Génère des en-têtes HTTP cohérents sans forcer Brotli ('br') afin que httpx
-    décompresse nativement les réponses gzip/deflate de SeLoger, Orpi et Bien'ici.
+    décompresse nativement les réponses gzip/deflate d'Orpi et Bien'ici.
     """
     ua = random.choice(ROTATING_USER_AGENTS)
     headers = {
@@ -294,8 +292,6 @@ def _get_city_meta(city_name: str) -> Dict[str, str]:
 
 
 def _infer_referer(url: str) -> str:
-    if "seloger.com" in url:
-        return "https://www.seloger.com/"
     if "bienici.com" in url:
         return "https://www.bienici.com/recherche/achat/france"
     if "orpi.com" in url:
@@ -1085,262 +1081,6 @@ def scrape_orpi_live(
     return results
 
 
-def resolve_seloger_place_id(client: httpx.Client, city_name: str) -> str:
-    """Résout le placeId SeLoger (ex: AD08FR23435) pour une commune donnée."""
-    matched = _match_known_city(city_name)
-    if matched and CITY_METADATA[matched].get("seloger_place_id"):
-        return CITY_METADATA[matched]["seloger_place_id"]
-
-    c_norm = _normalize_city(city_name)
-    for known_city, meta in CITY_METADATA.items():
-        if _normalize_city(known_city) == c_norm and meta.get("seloger_place_id"):
-            return meta["seloger_place_id"]
-
-    slug = c_norm.replace(" ", "-")
-    try:
-        url = f"https://www.seloger.com/immobilier/achat/immo-{slug}-59/"
-        resp = robust_http_get(client, url, max_retries=1)
-        if resp and resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for s in soup.find_all("script"):
-                txt = s.string or ""
-                if "__UFRN_FETCHER__" in txt:
-                    start = txt.find("JSON.parse(") + len("JSON.parse(")
-                    end = txt.rfind(")")
-                    data = json.loads(json.loads(txt[start:end]))
-                    locs = (
-                        data.get("data", {})
-                        .get("classified-serp-data", {})
-                        .get("searchModel", {})
-                        .get("locations", [])
-                    )
-                    if locs and locs[0].get("placeId"):
-                        return str(locs[0]["placeId"])
-    except Exception:
-        pass
-    return ""
-
-
-def scrape_seloger_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List[Dict[str, Any]]:
-    """
-    Scrape en temps réel les annonces SeLoger.com (via le flux SSR __UFRN_FETCHER__
-    de /classified-search) pour les villes, budget et surface sélectionnés,
-    avec extraction du DPE officiel (`energyClass`), filtrage des suggestions hors-secteur
-    et bascule automatique Playwright en cas de défi anti-bot / DataDome.
-    """
-    results: List[Dict[str, Any]] = []
-    seen_ids = set()
-    tx_type = "rent" if str(criteria.get("transaction_type", "buy")).strip().lower() in ("rent", "location") else "buy"
-    min_price_floor = 250 if tx_type == "rent" else 70000
-    max_budget = int(criteria.get("max_budget", 1500 if tx_type == "rent" else 280000))
-    min_surface = float(criteria.get("min_surface", 80.0))
-    min_rooms = int(criteria.get("min_rooms", 0) or 0)
-    min_bedrooms = int(criteria.get("min_bedrooms", 0) or 0)
-    cities = criteria.get("cities", list(CITY_METADATA.keys()))
-
-    estate_types = []
-    selected_types = [t.lower() for t in criteria.get("property_types", ["Maison", "Appartement"])]
-    if "maison" in selected_types:
-        estate_types.append("House")
-    if "appartement" in selected_types:
-        estate_types.append("Apartment")
-    if not estate_types:
-        estate_types = ["House", "Apartment"]
-
-    dist_type = "Rent" if tx_type == "rent" else "Buy"
-    extra_seloger_params = ""
-    if min_rooms > 0:
-        extra_seloger_params += f"&nbOfRoomsMin={min_rooms}"
-    if min_bedrooms > 0:
-        extra_seloger_params += f"&nbOfBedroomsMin={min_bedrooms}"
-
-    seloger_headers = get_browser_headers(accept_json=False)
-
-    with httpx.Client(headers=seloger_headers, timeout=timeout, follow_redirects=True, verify=False) as client:
-        for city in cities:
-            place_id = resolve_seloger_place_id(client, city)
-            if not place_id:
-                continue
-
-            for page_num in range(1, 5):
-                url = (
-                    f"https://www.seloger.com/classified-search?"
-                    f"distributionTypes={dist_type}&estateTypes={','.join(estate_types)}"
-                    f"&locations={place_id}&priceMin={min_price_floor}&priceMax={max_budget}&spaceMin={int(min_surface)}"
-                    f"{extra_seloger_params}&page={page_num}"
-                )
-                try:
-                    resp = robust_http_get(client, url, max_retries=1)
-                    html_text = ""
-                    used_playwright = False
-                    if resp and resp.status_code == 200:
-                        html_text = resp.text
-                    elif (not resp or resp.status_code in (403, 429)) and page_num == 1:
-                        html_text = fetch_page_content_playwright(url, timeout=timeout) or ""
-                        used_playwright = True
-
-                    if not html_text:
-                        break
-
-                    soup = BeautifulSoup(html_text, "html.parser")
-                    page_new_count = 0
-
-                    for s in soup.find_all("script"):
-                        txt = s.string or ""
-                        if "__UFRN_FETCHER__" not in txt:
-                            continue
-                        try:
-                            start = txt.find("JSON.parse(") + len("JSON.parse(")
-                            end = txt.rfind(")")
-                            data = json.loads(json.loads(txt[start:end]))
-                            serp = data.get("data", {}).get("classified-serp-data", {})
-                            cdata = serp.get("classifiedsData", {})
-                        except Exception:
-                            continue
-
-                        if not cdata:
-                            continue
-
-                        enriched_meta = serp.get("enrichedClassifiedsData", {})
-                        suggested_ids = set(str(x) for x in (serp.get("suggestedClassifieds") or []))
-
-                        for ad_id, item in cdata.items():
-                            ad_id_str = str(ad_id).strip()
-                            if not ad_id_str or ad_id_str in seen_ids:
-                                continue
-
-                            raw = item.get("rawData") or {}
-                            item_status = str(item.get("status") or raw.get("status") or "").strip().upper()
-                            if (
-                                item.get("isSold") is True
-                                or raw.get("isSold") is True
-                                or item_status
-                                in ("SOLD", "INACTIVE", "EXPIRED", "DELETED", "ARCHIVED", "UNAVAILABLE", "CLOSED")
-                            ):
-                                continue
-
-                            is_suggestion = (
-                                ad_id_str in suggested_ids
-                                or bool((enriched_meta.get(ad_id_str) or {}).get("isSuggestion"))
-                            )
-
-                            price = int(raw.get("price") or 0)
-                            surf_obj = raw.get("surface") or {}
-                            surface = float(surf_obj.get("main") or 0.0)
-                            if price < min_price_floor or price > max_budget or surface < min_surface:
-                                continue
-
-                            prop_raw = str(raw.get("propertyType") or "").upper()
-                            prop_type = "Maison" if "HOUSE" in prop_raw else "Appartement"
-                            if selected_types and prop_type.lower() not in selected_types:
-                                continue
-
-                            rooms = int(raw.get("nbroom") or 0)
-                            bedrooms = int(raw.get("nbbedroom") or 0)
-
-                            loc_addr = (item.get("location") or {}).get("address") or {}
-                            ad_city = _canonical_city_name(str(loc_addr.get("city") or city).strip(), cities)
-                            if is_suggestion and not _city_matches_targets(ad_city, cities):
-                                continue
-                            if not _city_matches_targets(ad_city, cities):
-                                continue
-
-                            ad_city_meta = _get_city_meta(ad_city)
-                            zip_code = str(loc_addr.get("zipCode") or ad_city_meta.get("postal_code", "59000"))
-                            district = str(loc_addr.get("district") or "").strip()
-
-                            main_desc = item.get("mainDescription") or {}
-                            headline = _clean_html_text(str(main_desc.get("headline") or ""))
-                            desc_body = _clean_html_text(str(main_desc.get("description") or ""))
-
-                            if bedrooms == 0:
-                                bedrooms = _extract_bedrooms_from_text(f"{headline} {desc_body}", rooms)
-
-                            if min_rooms > 0 and rooms > 0 and rooms < min_rooms:
-                                continue
-                            if min_bedrooms > 0 and bedrooms > 0 and bedrooms < min_bedrooms:
-                                continue
-
-                            seen_ids.add(ad_id_str)
-                            page_new_count += 1
-
-                            hard_facts = item.get("hardFacts") or {}
-                            keyfacts = [str(kf) for kf in (hard_facts.get("keyfacts") or [])]
-                            if bedrooms and not any("chambre" in kf.lower() for kf in keyfacts):
-                                keyfacts.append(f"{bedrooms} chambres")
-
-                            provider = item.get("provider") or {}
-                            agency_card = provider.get("intermediaryCard") or {}
-                            agency_title = str(agency_card.get("title") or "Agence SeLoger").strip()
-
-                            full_title = (
-                                headline
-                                if len(headline) > 12
-                                else f"{prop_type} {rooms} pièces {surface:g} m² - {ad_city}"
-                            )
-                            if district and district.lower() not in full_title.lower():
-                                full_title += f" ({district})"
-
-                            raw_energy = str(item.get("energyClass") or "").strip().upper()
-                            if raw_energy in ("A", "B", "C", "D", "E", "F", "G"):
-                                dpe = raw_energy
-                            else:
-                                m_dpe = re.search(
-                                    r"\bdpe\s*[:\-]?\s*([a-g])\b",
-                                    f"{full_title} {desc_body}",
-                                    re.IGNORECASE,
-                                )
-                                dpe = m_dpe.group(1).upper() if m_dpe else "Non renseigné"
-
-                            full_desc = desc_body
-                            if keyfacts:
-                                full_desc += f" [Caractéristiques SeLoger : {', '.join(keyfacts)}]"
-                            if surf_obj.get("plot"):
-                                full_desc += f" [Terrain : {surf_obj.get('plot')} m²]"
-                            if dpe != "Non renseigné":
-                                full_desc += f" [DPE : {dpe}]"
-
-                            if detect_unavailable_reason(full_title, full_desc, tx_type=tx_type):
-                                continue
-
-                            has_parking = _detect_parking_in_text(f"{full_title} {full_desc}")
-
-                            ad_url = str(item.get("url") or f"https://www.seloger.com/annonce/{'location' if tx_type == 'rent' else 'achat'}/{ad_id_str}")
-                            if ad_url.startswith("/"):
-                                ad_url = "https://www.seloger.com" + ad_url
-
-                            src_tag = f"SeLoger ({agency_title})"
-                            if used_playwright:
-                                src_tag += " [Playwright]"
-
-                            results.append(
-                                {
-                                    "external_id": f"seloger-{ad_id_str}",
-                                    "source": src_tag,
-                                    "url": ad_url,
-                                    "title": full_title,
-                                    "transaction_type": tx_type,
-                                    "property_type": prop_type,
-                                    "price": price,
-                                    "surface": surface,
-                                    "rooms": rooms,
-                                    "bedrooms": bedrooms,
-                                    "city": ad_city,
-                                    "postal_code": zip_code,
-                                    "description": full_desc or full_title,
-                                    "dpe": dpe,
-                                    "has_parking": has_parking,
-                                }
-                            )
-
-                    if page_new_count == 0:
-                        break
-                except Exception:
-                    break
-
-    return results
-
-
 def parse_leboncoin_payload(
     raw_content: str,
     criteria: Dict[str, Any],
@@ -1536,86 +1276,13 @@ def parse_leboncoin_payload(
     return results
 
 
-def scrape_leboncoin_live(criteria: Dict[str, Any], timeout: float = 12.0) -> Tuple[List[Dict[str, Any]], bool]:
-    """
-    Tente de scraper en direct les annonces LeBonCoin (Particuliers & Pros) pour chaque commune ciblée.
-    Retourne `(annonces, anti_bot_detected)` : si la protection anti-bot DataDome de LeBonCoin bloque
-    l'accès automatisé (HTTP 403 / page de vérification), le scraper s'arrête proprement sans tenter
-    de contourner ou résoudre le challenge, et signale à l'utilisateur qu'il peut ouvrir les liens
-    directs LeBonCoin ou importer une annonce dans l'onglet dédié.
-    """
-    results: List[Dict[str, Any]] = []
-    seen_ids = set()
-    anti_bot_blocked = False
-
-    tx_type = "rent" if str(criteria.get("transaction_type", "buy")).strip().lower() in ("rent", "location") else "buy"
-    min_price_floor = 250 if tx_type == "rent" else 70000
-    max_budget = int(criteria.get("max_budget", 1500 if tx_type == "rent" else 280000))
-    min_surface = int(criteria.get("min_surface", 80))
-    min_rooms = int(criteria.get("min_rooms", 0) or 0)
-    min_bedrooms = int(criteria.get("min_bedrooms", 0) or 0)
-    cities = criteria.get("cities", list(CITY_METADATA.keys()))
-    selected_types = [t.lower() for t in criteria.get("property_types", ["Maison", "Appartement"])]
-
-    lbc_cat = "10" if tx_type == "rent" else "9"
-    re_types = []
-    if "maison" in selected_types:
-        re_types.append("1")
-    if "appartement" in selected_types:
-        re_types.append("2")
-    if not re_types:
-        re_types = ["1", "2"]
-
-    lbc_cookie = os.getenv("LEBONCOIN_COOKIE", "").strip()
-    headers = get_browser_headers(accept_json=False)
-    if lbc_cookie:
-        headers["Cookie"] = lbc_cookie
-
-    with httpx.Client(headers=headers, timeout=timeout, follow_redirects=True, verify=False) as client:
-        for city in cities:
-            meta = _get_city_meta(city)
-            cp = meta.get("postal_code", "59000")
-            loc_param = urllib.parse.quote(f"{city}_{cp}")
-            url = (
-                f"https://www.leboncoin.fr/recherche?category={lbc_cat}&locations={loc_param}"
-                f"&price={min_price_floor}-{max_budget}&square={min_surface}-max"
-                f"&real_estate_type={','.join(re_types)}"
-            )
-            if min_rooms > 0:
-                url += f"&rooms={min_rooms}-max"
-            if min_bedrooms > 0:
-                url += f"&bedrooms={min_bedrooms}-max"
-
-            try:
-                resp = robust_http_get(client, url, max_retries=0)
-                if not resp:
-                    continue
-                body_text = resp.text or ""
-                if resp.status_code == 403 or "geo.captcha-delivery.com" in body_text:
-                    anti_bot_blocked = True
-                    # Ne pas insister si le portail présente un challenge anti-bot DataDome
-                    break
-
-                if resp.status_code == 200 and "__NEXT_DATA__" in body_text:
-                    city_ads = parse_leboncoin_payload(body_text, criteria, fallback_city=city)
-                    for ad in city_ads:
-                        if ad["external_id"] not in seen_ids:
-                            seen_ids.add(ad["external_id"])
-                            results.append(ad)
-            except Exception:
-                continue
-
-    return results, anti_bot_blocked
-
-
 def check_single_listing_availability(client: httpx.Client, listing: Dict[str, Any]) -> Tuple[Optional[bool], str]:
     """
     Vérifie si une annonce est toujours disponible :
     1. Contrôle textuel instantané (titre + description).
     2. Vérification API directe pour Bien'ici (`realEstateAd.json?id=...`) et fiche HTML pour Orpi.
-    Ne requiert jamais les portails protégés par DataDome (SeLoger / LeBonCoin).
     Retourne `(True, "")` si confirmée disponible, `(False, raison)` si confirmée indisponible,
-    ou `(None, "")` si la vérification est impossible ou non concluante (erreur transitoire / DataDome).
+    ou `(None, "")` si la vérification est impossible ou non concluante (erreur transitoire).
     """
     tx_type = "rent" if str(listing.get("transaction_type") or "buy").strip().lower() in ("rent", "location") else "buy"
     title = str(listing.get("title") or "")
@@ -1697,7 +1364,7 @@ def check_listings_availability_batch(
 ) -> List[Tuple[int, bool, str]]:
     """
     Vérifie en parallèle la disponibilité réelle d'une liste d'annonces en base
-    (contrôle textuel + API Bien'ici + fiches Orpi, sans requêter les portails DataDome).
+    (contrôle textuel + API Bien'ici + fiches Orpi).
     Retourne uniquement les statuts confirmés `(listing_id, is_available, reason)`.
     """
     results: List[Tuple[int, bool, str]] = []
@@ -1736,25 +1403,15 @@ def scrape_all_live_sources(
     existing_orpi_cache: Optional[Dict[str, Tuple[str, str, str, Optional[int]]]] = None,
 ) -> Dict[str, Any]:
     """
-    Exécute le scraping live multi-sources (SeLoger + Bien'ici + Réseaux d'Agences + Orpi + LeBonCoin)
-    EN PARALLÈLE sur 4 threads avec sessions HTTP/2 Keep-Alive et cache d'enrichissement Orpi.
+    Exécute le scraping live multi-sources (Bien'ici + Réseaux d'Agences + Orpi)
+    EN PARALLÈLE sur 2 threads avec sessions HTTP/2 Keep-Alive et cache d'enrichissement Orpi.
     """
-    seloger_ads: List[Dict[str, Any]] = []
     bienici_ads: List[Dict[str, Any]] = []
     orpi_ads: List[Dict[str, Any]] = []
-    lbc_ads: List[Dict[str, Any]] = []
-    lbc_blocked = False
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        f_seloger = executor.submit(scrape_seloger_live, criteria)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         f_bienici = executor.submit(scrape_bienici_live, criteria, None)
         f_orpi = executor.submit(scrape_orpi_live, criteria, 12.0, existing_orpi_cache)
-        f_lbc = executor.submit(scrape_leboncoin_live, criteria)
-
-        try:
-            seloger_ads = f_seloger.result()
-        except Exception:
-            seloger_ads = []
 
         try:
             bienici_ads = f_bienici.result()
@@ -1766,20 +1423,12 @@ def scrape_all_live_sources(
         except Exception:
             orpi_ads = []
 
-        try:
-            lbc_ads, lbc_blocked = f_lbc.result()
-        except Exception:
-            lbc_ads, lbc_blocked = [], False
-
-    combined = seloger_ads + bienici_ads + orpi_ads + lbc_ads
+    combined = bienici_ads + orpi_ads
     return {
         "ads": combined,
         "stats": {
-            "seloger": len(seloger_ads),
             "bienici_agences": len(bienici_ads),
             "orpi_direct": len(orpi_ads),
-            "leboncoin": len(lbc_ads),
-            "leboncoin_blocked": lbc_blocked,
             "total": len(combined),
         },
     }

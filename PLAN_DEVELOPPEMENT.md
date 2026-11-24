@@ -16,7 +16,7 @@ Développer une application autonome en local (via `.venv` Python, sans Docker) 
 | Composant | Technologie Retenue | Rôle dans le Système |
 | --- | --- | --- |
 | **Environnement** | Python 3.13 (`.venv` local) | Isolation complète des dépendances sans Docker. |
-| **Orchestration / Scraping** | Python (`httpx` / `BeautifulSoup` / `Playwright`) | Collecte multi-sources (Bien'ici, SeLoger, LeBonCoin) + résilience anti-WAF automatique. |
+| **Orchestration / Scraping** | Python (`httpx` / `BeautifulSoup` / `Playwright`) | Collecte multi-sources (Bien'ici, Orpi) + résilience anti-WAF automatique. |
 | **Base de données** | SQLite (`mandataire.db` + `init.sql`) | Stockage relationnel local sans serveur, dédoublonnage par URL/ID, persistance des critères, statuts CRM et quarantaine. |
 | **Moteur d'Analyse (IA)** | API Gemini (`gemini-4-hydrogen` & fallback local) | Extraction structurée JSON (Pydantic) avec parallélisation multi-threads et circuit-breaker anti-quota. |
 | **Interface Utilisateur** | Streamlit (`app.py`) | Cockpit interactif avec gestion de sélection, suivi d'agences/visites, quarantaine restaurable et exports Excel/CSV. |
@@ -68,7 +68,7 @@ Développer une application autonome en local (via `.venv` Python, sans Docker) 
 * `scraper.py` :
   - **Bypass WAF & Anti-bot** : rotation de User-Agents récents et headers navigateurs réalistes.
   - **Retries avec backoff exponentiel** sur requêtes HTTP `httpx`.
-  - **Bascule Playwright automatique** : utilisation de Chromium headless pour contourner les challenges DataDome / Cloudflare sur SeLoger, Bien'ici et Orpi.
+  - **Bascule Playwright automatique** : utilisation de Chromium headless pour contourner les challenges DataDome / Cloudflare sur Bien'ici et Orpi.
 * `app.py` & `run.ps1` :
   - **Gestion de la Sélection :** Onglet dédié avec indicateurs clés (contacts pris, visites programmées, budget moyen), formulaires interactifs de suivi agence et bouton d'appel direct.
   - **Page Quarantaine :** Suppression douce masquant l'annonce du flux du marché, avec options de restauration unitaire ou globale, et purge définitive.
