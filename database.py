@@ -1,110 +1,48 @@
 import json
-import os
-import shutil
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from scraper import _canonical_city_name
 
-SEED_DB_PATH = Path(__file__).parent / "mandataire.db"
+DB_PATH = Path(__file__).parent / "mandataire.db"
 INIT_SQL_PATH = Path(__file__).parent / "init.sql"
-
-# Sur Streamlit Cloud (/mount/src), utiliser une copie de travail dans /tmp pour ne jamais
-# salir le fichier mandataire.db suivi par Git (ce qui bloquerait les git pull automatiques de Streamlit Cloud)
-IS_CLOUD_ENV = Path("/mount/src").exists() or bool(os.getenv("STREAMLIT_RUNTIME_ENV"))
-DB_PATH = Path("/tmp/mandataire_cloud_runtime.db") if IS_CLOUD_ENV else SEED_DB_PATH
-_LAST_SYNCED_SEED_MTIME: Optional[float] = None
-
-
-def _ensure_cloud_db_synced() -> None:
-    """
-    Sur Streamlit Cloud, initialise la BDD de travail depuis mandataire.db (seed Git)
-    et fusionne automatiquement les nouvelles annonces ou mises à jour des scrapers
-    si mandataire.db a été mis à jour par un git push/pull, sans écraser le suivi CRM.
-    """
-    global _LAST_SYNCED_SEED_MTIME
-    if not IS_CLOUD_ENV or not SEED_DB_PATH.exists():
-        return
-
-    seed_mtime = SEED_DB_PATH.stat().st_mtime
-    if not DB_PATH.exists():
-        shutil.copy2(SEED_DB_PATH, DB_PATH)
-        _LAST_SYNCED_SEED_MTIME = seed_mtime
-        return
-
-    if _LAST_SYNCED_SEED_MTIME is not None and seed_mtime <= _LAST_SYNCED_SEED_MTIME:
-        return
-
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.row_factory = sqlite3.Row
-            conn.execute("ATTACH DATABASE ? AS seed_db", (str(SEED_DB_PATH),))
-            # Fusionner les nouvelles annonces du seed et mettre à jour les métadonnées scrapées des existantes
-            conn.execute(
-                """
-                UPDATE listings
-                SET source = COALESCE((SELECT s.source FROM seed_db.listings s WHERE s.external_id = listings.external_id), source),
-                    title = COALESCE((SELECT s.title FROM seed_db.listings s WHERE s.external_id = listings.external_id), title),
-                    city = COALESCE((SELECT s.city FROM seed_db.listings s WHERE s.external_id = listings.external_id), city),
-                    postal_code = COALESCE((SELECT s.postal_code FROM seed_db.listings s WHERE s.external_id = listings.external_id), postal_code),
-                    description = CASE
-                        WHEN length(COALESCE((SELECT s.description FROM seed_db.listings s WHERE s.external_id = listings.external_id), '')) > length(COALESCE(listings.description, ''))
-                        THEN (SELECT s.description FROM seed_db.listings s WHERE s.external_id = listings.external_id)
-                        ELSE listings.description
-                    END,
-                    dpe = CASE
-                        WHEN listings.dpe IS NULL OR listings.dpe = 'Non renseigné'
-                        THEN COALESCE((SELECT s.dpe FROM seed_db.listings s WHERE s.external_id = listings.external_id), listings.dpe)
-                        ELSE listings.dpe
-                    END,
-                    has_parking = COALESCE((SELECT s.has_parking FROM seed_db.listings s WHERE s.external_id = listings.external_id), listings.has_parking)
-                WHERE EXISTS (SELECT 1 FROM seed_db.listings s WHERE s.external_id = listings.external_id)
-                """
-            )
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO listings (
-                    external_id, source, url, title, property_type,
-                    price, surface, rooms, city, postal_code,
-                    description, dpe, has_parking, raw_json,
-                    status, ai_score, price_per_m2, ai_summary,
-                    ai_rejection_reason, ai_pros, ai_cons, ai_signals,
-                    ai_analysis_json,
-                    is_selected, is_quarantined, contact_made, visit_scheduled,
-                    agency_name, agency_phone, followup_notes,
-                    selected_at, quarantined_at, scraped_at, analyzed_at
-                )
-                SELECT
-                    external_id, source, url, title, property_type,
-                    price, surface, rooms, city, postal_code,
-                    description, dpe, has_parking, raw_json,
-                    status, ai_score, price_per_m2, ai_summary,
-                    ai_rejection_reason, ai_pros, ai_cons, ai_signals,
-                    ai_analysis_json,
-                    is_selected, is_quarantined, contact_made, visit_scheduled,
-                    agency_name, agency_phone, followup_notes,
-                    selected_at, quarantined_at, scraped_at, analyzed_at
-                FROM seed_db.listings
-                """
-            )
-            conn.commit()
-            conn.execute("DETACH DATABASE seed_db")
-        _LAST_SYNCED_SEED_MTIME = seed_mtime
-    except Exception:
-        _LAST_SYNCED_SEED_MTIME = seed_mtime
+_DB_INITIALIZED = False
 
 
 def get_connection() -> sqlite3.Connection:
-    _ensure_cloud_db_synced()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-32000")
     return conn
 
 
-def init_db() -> None:
-    """Initialise la base de données SQLite et applique les migrations de schéma si nécessaire."""
+def init_db(force: bool = False) -> None:
+    """Initialise la base de données SQLite et applique les migrations de schéma une seule fois par processus."""
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED and not force and DB_PATH.exists():
+        return
+
     with get_connection() as conn:
-        # Vérifier si la table listings existe déjà pour appliquer les migrations avant la création des index
+        has_criteria = conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='search_criteria'"
+        ).fetchone()[0] > 0
+
+        if has_criteria:
+            cursor = conn.execute("PRAGMA table_info(search_criteria)")
+            existing_crit_cols = {row["name"] for row in cursor.fetchall()}
+            crit_column_definitions = [
+                ("transaction_type", "TEXT NOT NULL DEFAULT 'buy'"),
+                ("min_rooms", "INTEGER NOT NULL DEFAULT 0"),
+                ("min_bedrooms", "INTEGER NOT NULL DEFAULT 0"),
+            ]
+            for col_name, col_def in crit_column_definitions:
+                if col_name not in existing_crit_cols:
+                    conn.execute(f"ALTER TABLE search_criteria ADD COLUMN {col_name} {col_def}")
+            conn.commit()
+
         has_listings = conn.execute(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='listings'"
         ).fetchone()[0] > 0
@@ -114,6 +52,8 @@ def init_db() -> None:
             existing_cols = {row["name"] for row in cursor.fetchall()}
 
             column_definitions = [
+                ("transaction_type", "TEXT DEFAULT 'buy'"),
+                ("bedrooms", "INTEGER DEFAULT 0"),
                 ("is_selected", "INTEGER NOT NULL DEFAULT 0"),
                 ("is_quarantined", "INTEGER NOT NULL DEFAULT 0"),
                 ("contact_made", "INTEGER NOT NULL DEFAULT 0"),
@@ -123,6 +63,9 @@ def init_db() -> None:
                 ("followup_notes", "TEXT DEFAULT ''"),
                 ("selected_at", "TIMESTAMP DEFAULT NULL"),
                 ("quarantined_at", "TIMESTAMP DEFAULT NULL"),
+                ("is_available", "INTEGER NOT NULL DEFAULT 1"),
+                ("unavailable_reason", "TEXT DEFAULT ''"),
+                ("availability_checked_at", "TIMESTAMP DEFAULT NULL"),
             ]
 
             for col_name, col_def in column_definitions:
@@ -135,6 +78,7 @@ def init_db() -> None:
             conn.executescript(sql_script)
 
         conn.commit()
+    _DB_INITIALIZED = True
 
 
 def get_criteria() -> Dict[str, Any]:
@@ -144,8 +88,11 @@ def get_criteria() -> Dict[str, Any]:
         row = conn.execute("SELECT * FROM search_criteria WHERE id = 1").fetchone()
         if not row:
             return {
+                "transaction_type": "buy",
                 "max_budget": 280000,
                 "min_surface": 80.0,
+                "min_rooms": 0,
+                "min_bedrooms": 0,
                 "property_types": ["Maison", "Appartement"],
                 "cities": ["Croix", "Wasquehal", "Roubaix", "Villeneuve-d'Ascq", "Marcq-en-Barœul"],
                 "require_parking": True,
@@ -156,6 +103,11 @@ def get_criteria() -> Dict[str, Any]:
                 "custom_notes": "",
             }
         data = dict(row)
+        data["transaction_type"] = str(data.get("transaction_type") or "buy").strip().lower()
+        if data["transaction_type"] not in ("buy", "rent"):
+            data["transaction_type"] = "buy"
+        data["min_rooms"] = int(data.get("min_rooms") or 0)
+        data["min_bedrooms"] = int(data.get("min_bedrooms") or 0)
         data["property_types"] = [t.strip() for t in data["property_types"].split(",") if t.strip()]
         raw_cities = [c.strip() for c in data["cities"].split(",") if c.strip()]
         data["cities"] = [_canonical_city_name(c) for c in raw_cities]
@@ -172,6 +124,9 @@ def save_criteria(
     min_surface: float,
     property_types: List[str],
     cities: List[str],
+    transaction_type: str = "buy",
+    min_rooms: int = 0,
+    min_bedrooms: int = 0,
     require_parking: bool = True,
     exclude_dpe_fg: bool = True,
     exclude_occupied: bool = True,
@@ -186,12 +141,16 @@ def save_criteria(
         canon = _canonical_city_name(c)
         if canon and canon not in normalized_cities:
             normalized_cities.append(canon)
+    tx_type = "rent" if str(transaction_type).strip().lower() in ("rent", "location") else "buy"
     with get_connection() as conn:
         conn.execute(
             """
             UPDATE search_criteria
-            SET max_budget = ?,
+            SET transaction_type = ?,
+                max_budget = ?,
                 min_surface = ?,
+                min_rooms = ?,
+                min_bedrooms = ?,
                 property_types = ?,
                 cities = ?,
                 require_parking = ?,
@@ -204,8 +163,11 @@ def save_criteria(
             WHERE id = 1
             """,
             (
+                tx_type,
                 int(max_budget),
                 float(min_surface),
+                int(min_rooms),
+                int(min_bedrooms),
                 ",".join(property_types),
                 ",".join(normalized_cities),
                 int(require_parking),
@@ -219,14 +181,8 @@ def save_criteria(
         conn.commit()
 
 
-def upsert_listing(listing: Dict[str, Any]) -> bool:
-    """
-    Insère une nouvelle annonce si son external_id ou son url n'existe pas encore,
-    ou enrichit/met à jour ses métadonnées scrapées (DPE, parking, description, ville, prix)
-    si elle existe déjà en préservant le tri IA et le suivi CRM.
-    Retourne True si l'annonce est nouvelle, False si elle existait déjà (et a été rafraîchie).
-    """
-    init_db()
+def _upsert_single_in_conn(conn: sqlite3.Connection, listing: Dict[str, Any]) -> bool:
+    """Insère ou met à jour une annonce au sein d'une transaction SQLite ouverte."""
     price = int(listing.get("price", 0))
     surface = float(listing.get("surface", 0.0))
     price_per_m2 = round(price / surface, 2) if surface > 0 else 0.0
@@ -234,96 +190,168 @@ def upsert_listing(listing: Dict[str, Any]) -> bool:
     new_dpe = str(listing.get("dpe") or "Non renseigné").strip()
     new_desc = str(listing.get("description") or "")
     new_parking = None if listing.get("has_parking") is None else int(bool(listing.get("has_parking")))
+    tx_type = "rent" if str(listing.get("transaction_type", "buy")).strip().lower() in ("rent", "location") else "buy"
+    rooms_val = int(listing.get("rooms", 0) or 0)
+    bedrooms_val = int(listing.get("bedrooms", 0) or 0)
+    is_avail = 1 if listing.get("is_available", True) else 0
+    unavail_reason = "" if is_avail else str(listing.get("unavailable_reason") or "").strip()
 
-    with get_connection() as conn:
-        existing = conn.execute(
-            "SELECT id, description, dpe, has_parking FROM listings WHERE external_id = ? OR url = ?",
-            (listing["external_id"], listing["url"]),
-        ).fetchone()
-        if existing:
-            old_desc = str(existing["description"] or "")
-            best_desc = new_desc if len(new_desc) >= len(old_desc) else old_desc
-            old_dpe = str(existing["dpe"] or "Non renseigné")
-            best_dpe = new_dpe if new_dpe in ("A", "B", "C", "D", "E", "F", "G") else old_dpe
-            best_parking = new_parking if new_parking is not None else existing["has_parking"]
+    existing = conn.execute(
+        "SELECT id, description, dpe, has_parking, bedrooms FROM listings WHERE external_id = ? OR url = ?",
+        (listing["external_id"], listing["url"]),
+    ).fetchone()
 
-            conn.execute(
-                """
-                UPDATE listings
-                SET source = ?,
-                    title = ?,
-                    property_type = ?,
-                    price = ?,
-                    surface = ?,
-                    rooms = ?,
-                    city = ?,
-                    postal_code = ?,
-                    description = ?,
-                    dpe = ?,
-                    has_parking = ?,
-                    price_per_m2 = ?,
-                    raw_json = ?
-                WHERE id = ?
-                """,
-                (
-                    listing.get("source", "Manuel"),
-                    listing["title"],
-                    listing.get("property_type", "Autre"),
-                    price,
-                    surface,
-                    int(listing.get("rooms", 0)),
-                    canon_city,
-                    listing.get("postal_code", ""),
-                    best_desc,
-                    best_dpe,
-                    best_parking,
-                    price_per_m2,
-                    json.dumps(listing, ensure_ascii=False),
-                    existing["id"],
-                ),
-            )
-            conn.commit()
-            return False
+    if existing:
+        old_desc = str(existing["description"] or "")
+        best_desc = new_desc if len(new_desc) >= len(old_desc) else old_desc
+        old_dpe = str(existing["dpe"] or "Non renseigné")
+        best_dpe = new_dpe if new_dpe in ("A", "B", "C", "D", "E", "F", "G") else old_dpe
+        best_parking = new_parking if new_parking is not None else existing["has_parking"]
+        best_bedrooms = bedrooms_val if bedrooms_val > 0 else int(existing["bedrooms"] or 0)
 
         conn.execute(
             """
-            INSERT INTO listings (
-                external_id, source, url, title, property_type,
-                price, surface, rooms, city, postal_code,
-                description, dpe, has_parking, price_per_m2, raw_json, status,
-                is_selected, is_quarantined
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_analysis', 0, 0)
+            UPDATE listings
+            SET source = ?,
+                title = ?,
+                transaction_type = ?,
+                property_type = ?,
+                price = ?,
+                surface = ?,
+                rooms = ?,
+                bedrooms = ?,
+                city = ?,
+                postal_code = ?,
+                description = ?,
+                dpe = ?,
+                has_parking = ?,
+                price_per_m2 = ?,
+                raw_json = ?,
+                is_available = ?,
+                unavailable_reason = ?,
+                availability_checked_at = CURRENT_TIMESTAMP
+            WHERE id = ?
             """,
             (
-                listing["external_id"],
                 listing.get("source", "Manuel"),
-                listing["url"],
                 listing["title"],
+                tx_type,
                 listing.get("property_type", "Autre"),
                 price,
                 surface,
-                int(listing.get("rooms", 0)),
+                rooms_val,
+                best_bedrooms,
                 canon_city,
                 listing.get("postal_code", ""),
-                new_desc,
-                new_dpe,
-                new_parking,
+                best_desc,
+                best_dpe,
+                best_parking,
                 price_per_m2,
                 json.dumps(listing, ensure_ascii=False),
+                is_avail,
+                unavail_reason,
+                existing["id"],
             ),
         )
+        return False
+
+    conn.execute(
+        """
+        INSERT INTO listings (
+            external_id, source, url, title, transaction_type, property_type,
+            price, surface, rooms, bedrooms, city, postal_code,
+            description, dpe, has_parking, price_per_m2, raw_json, status,
+            is_selected, is_quarantined, is_available, unavailable_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_analysis', 0, 0, ?, ?)
+        """,
+        (
+            listing["external_id"],
+            listing.get("source", "Manuel"),
+            listing["url"],
+            listing["title"],
+            tx_type,
+            listing.get("property_type", "Autre"),
+            price,
+            surface,
+            rooms_val,
+            bedrooms_val,
+            canon_city,
+            listing.get("postal_code", ""),
+            new_desc,
+            new_dpe,
+            new_parking,
+            price_per_m2,
+            json.dumps(listing, ensure_ascii=False),
+            is_avail,
+            unavail_reason,
+        ),
+    )
+    return True
+
+
+def upsert_listing(listing: Dict[str, Any]) -> bool:
+    """Insère ou met à jour une annonce unitaire."""
+    init_db()
+    with get_connection() as conn:
+        is_new = _upsert_single_in_conn(conn, listing)
         conn.commit()
-        return True
+        return is_new
+
+
+def upsert_listings_batch(listings: List[Dict[str, Any]]) -> Tuple[int, int]:
+    """
+    Insère ou met à jour un lot d'annonces en UNE SEULE transaction SQLite atomique (mode WAL).
+    Retourne `(new_count, updated_count)`. Gain de vitesse ~50x sur de gros volumes.
+    """
+    init_db()
+    if not listings:
+        return 0, 0
+    new_count = 0
+    updated_count = 0
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for ad in listings:
+                if _upsert_single_in_conn(conn, ad):
+                    new_count += 1
+                else:
+                    updated_count += 1
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return new_count, updated_count
+
+
+def get_existing_orpi_descriptions() -> Dict[str, Tuple[str, str, str, Optional[int]]]:
+    """
+    Récupère un cache mémoire des annonces Orpi déjà présentes en base (`external_id -> (description, dpe, postal_code, has_parking)`)
+    pour éviter de re-télécharger inutilement les fiches détails HTML déjà enrichies.
+    """
+    init_db()
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT external_id, description, dpe, postal_code, has_parking FROM listings WHERE external_id LIKE 'orpi-%'"
+        ).fetchall()
+        return {
+            str(r["external_id"]): (
+                str(r["description"] or ""),
+                str(r["dpe"] or "Non renseigné"),
+                str(r["postal_code"] or ""),
+                r["has_parking"],
+            )
+            for r in rows
+        }
 
 
 def get_pending_listings() -> List[Dict[str, Any]]:
-    """Récupère toutes les annonces en attente d'analyse IA (hors annonces en quarantaine)."""
+    """Récupère toutes les annonces disponibles en attente d'analyse IA (hors quarantaine)."""
     init_db()
     with get_connection() as conn:
         rows = conn.execute(
             """
             SELECT * FROM listings
-            WHERE status = 'pending_analysis' AND is_quarantined = 0
+            WHERE status = 'pending_analysis' AND is_quarantined = 0 AND is_available = 1
             ORDER BY scraped_at DESC
             """
         ).fetchall()
@@ -378,6 +406,55 @@ def update_listing_analysis(listing_id: int, analysis: Dict[str, Any]) -> None:
         conn.commit()
 
 
+def update_listings_analysis_batch(updates: List[Tuple[int, Dict[str, Any]]]) -> None:
+    """Met à jour un lot d'analyses IA en une seule transaction SQLite."""
+    init_db()
+    if not updates:
+        return
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.executemany(
+                """
+                UPDATE listings
+                SET status = ?,
+                    ai_score = ?,
+                    price_per_m2 = COALESCE(?, price_per_m2),
+                    dpe = COALESCE(?, dpe),
+                    has_parking = ?,
+                    ai_summary = ?,
+                    ai_rejection_reason = ?,
+                    ai_pros = ?,
+                    ai_cons = ?,
+                    ai_signals = ?,
+                    ai_analysis_json = ?,
+                    analyzed_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                [
+                    (
+                        analysis.get("statut", "a_verifier"),
+                        int(analysis.get("score", 5)),
+                        analysis.get("prix_m2"),
+                        analysis.get("dpe_detecte"),
+                        None if analysis.get("parking_detecte") is None else int(bool(analysis.get("parking_detecte"))),
+                        analysis.get("resume", ""),
+                        analysis.get("raison_rejet"),
+                        json.dumps(analysis.get("points_forts", []), ensure_ascii=False),
+                        json.dumps(analysis.get("points_vigilance", []), ensure_ascii=False),
+                        json.dumps(analysis.get("signaux_faibles", []), ensure_ascii=False),
+                        json.dumps(analysis, ensure_ascii=False),
+                        listing_id,
+                    )
+                    for listing_id, analysis in updates
+                ],
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def _format_listing_rows(rows: List[sqlite3.Row]) -> List[Dict[str, Any]]:
     results = []
     for r in rows:
@@ -391,6 +468,9 @@ def _format_listing_rows(rows: List[sqlite3.Row]) -> List[Dict[str, Any]]:
         item["is_quarantined"] = bool(item.get("is_quarantined", 0))
         item["contact_made"] = bool(item.get("contact_made", 0))
         item["visit_scheduled"] = bool(item.get("visit_scheduled", 0))
+        raw_avail = item.get("is_available")
+        item["is_available"] = True if raw_avail is None else bool(raw_avail)
+        item["unavailable_reason"] = str(item.get("unavailable_reason") or "")
         results.append(item)
     return results
 
@@ -399,6 +479,7 @@ def get_all_listings(
     status_filter: Optional[List[str]] = None,
     include_quarantined: bool = False,
     only_selected: bool = False,
+    include_unavailable: bool = False,
 ) -> List[Dict[str, Any]]:
     """Récupère les annonces filtrables pour affichage dans Streamlit."""
     init_db()
@@ -408,6 +489,9 @@ def get_all_listings(
 
         if not include_quarantined:
             conditions.append("is_quarantined = 0")
+
+        if not include_unavailable:
+            conditions.append("is_available = 1")
 
         if only_selected:
             conditions.append("is_selected = 1")
@@ -425,6 +509,87 @@ def get_all_listings(
         """
         rows = conn.execute(query, params).fetchall()
         return _format_listing_rows(rows)
+
+
+def get_unavailable_listings() -> List[Dict[str, Any]]:
+    """Récupère les annonces détectées comme n'étant plus disponibles (hors quarantaine)."""
+    init_db()
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM listings
+            WHERE is_available = 0 AND is_quarantined = 0
+            ORDER BY COALESCE(availability_checked_at, scraped_at) DESC
+            """
+        ).fetchall()
+        return _format_listing_rows(rows)
+
+
+def mark_listings_availability_batch(updates: List[Tuple[int, bool, str]]) -> Tuple[int, int]:
+    """
+    Met à jour en une transaction le statut de disponibilité de plusieurs annonces.
+    Chaque élément est `(listing_id, is_available, reason)`.
+    Retourne `(marked_unavailable, confirmed_available)`.
+    """
+    init_db()
+    if not updates:
+        return 0, 0
+    marked_unavailable = 0
+    confirmed_available = 0
+    params = []
+    for listing_id, is_avail, reason in updates:
+        avail_int = 1 if is_avail else 0
+        reason_str = "" if avail_int else str(reason or "").strip()
+        if avail_int:
+            confirmed_available += 1
+        else:
+            marked_unavailable += 1
+        params.append((avail_int, reason_str, int(listing_id)))
+
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.executemany(
+                """
+                UPDATE listings
+                SET is_available = ?,
+                    unavailable_reason = ?,
+                    availability_checked_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                params,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return marked_unavailable, confirmed_available
+
+
+def quarantine_unavailable_listings() -> int:
+    """Place en quarantaine toutes les annonces actives marquées comme indisponibles."""
+    init_db()
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE listings
+            SET is_quarantined = 1,
+                is_selected = 0,
+                quarantined_at = CURRENT_TIMESTAMP
+            WHERE is_available = 0 AND is_quarantined = 0
+            """
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+def delete_unavailable_listings() -> int:
+    """Supprime définitivement toutes les annonces indisponibles non placées en quarantaine."""
+    init_db()
+    with get_connection() as conn:
+        cur = conn.execute("DELETE FROM listings WHERE is_available = 0 AND is_quarantined = 0")
+        conn.commit()
+        return cur.rowcount
 
 
 def get_selected_listings() -> List[Dict[str, Any]]:
@@ -597,11 +762,10 @@ def export_db_to_json() -> str:
 
 
 def import_db_from_json(json_str: str) -> int:
-    """Restaure les critères, annonces et suivi IA/CRM depuis un export JSON en préservant les enrichissements des nouveaux scrapers."""
+    """Restaure les critères, annonces et suivi IA/CRM depuis un export JSON en une seule transaction."""
     init_db()
     data = json.loads(json_str)
 
-    # Restauration éventuelle des critères avec normalisation orthographique des villes
     criteria = data.get("search_criteria")
     if criteria and isinstance(criteria, dict):
         raw_cities_val = criteria.get("cities")
@@ -617,8 +781,11 @@ def import_db_from_json(json_str: str) -> int:
             conn.execute(
                 """
                 UPDATE search_criteria
-                SET max_budget = COALESCE(?, max_budget),
+                SET transaction_type = COALESCE(?, transaction_type),
+                    max_budget = COALESCE(?, max_budget),
                     min_surface = COALESCE(?, min_surface),
+                    min_rooms = COALESCE(?, min_rooms),
+                    min_bedrooms = COALESCE(?, min_bedrooms),
                     property_types = COALESCE(?, property_types),
                     cities = COALESCE(?, cities),
                     require_parking = COALESCE(?, require_parking),
@@ -631,8 +798,11 @@ def import_db_from_json(json_str: str) -> int:
                 WHERE id = 1
                 """,
                 (
+                    criteria.get("transaction_type"),
                     criteria.get("max_budget"),
                     criteria.get("min_surface"),
+                    criteria.get("min_rooms"),
+                    criteria.get("min_bedrooms"),
                     criteria.get("property_types") if isinstance(criteria.get("property_types"), str) else ",".join(criteria.get("property_types", [])),
                     canon_cities_str,
                     criteria.get("require_parking"),
@@ -648,16 +818,18 @@ def import_db_from_json(json_str: str) -> int:
     listings = data.get("listings", [])
     restored = 0
     with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         for item in listings:
             canon_city = _canonical_city_name(str(item.get("city", "")))
             existing = conn.execute(
-                "SELECT description, dpe, has_parking FROM listings WHERE external_id = ?",
+                "SELECT description, dpe, has_parking, bedrooms FROM listings WHERE external_id = ?",
                 (item["external_id"],),
             ).fetchone()
 
             imp_desc = str(item.get("description") or "")
             imp_dpe = str(item.get("dpe") or "Non renseigné")
             imp_parking = item.get("has_parking")
+            imp_bedrooms = int(item.get("bedrooms") or 0)
 
             if existing:
                 ex_desc = str(existing["description"] or "")
@@ -668,30 +840,35 @@ def import_db_from_json(json_str: str) -> int:
                     imp_dpe = ex_dpe
                 if imp_parking is None and existing["has_parking"] is not None:
                     imp_parking = existing["has_parking"]
+                if imp_bedrooms == 0 and existing["bedrooms"]:
+                    imp_bedrooms = int(existing["bedrooms"])
 
             conn.execute(
                 """
                 INSERT OR REPLACE INTO listings (
-                    external_id, source, url, title, property_type,
-                    price, surface, rooms, city, postal_code,
+                    external_id, source, url, title, transaction_type, property_type,
+                    price, surface, rooms, bedrooms, city, postal_code,
                     description, dpe, has_parking, raw_json,
                     status, ai_score, price_per_m2, ai_summary,
                     ai_rejection_reason, ai_pros, ai_cons, ai_signals,
                     ai_analysis_json,
                     is_selected, is_quarantined, contact_made, visit_scheduled,
                     agency_name, agency_phone, followup_notes,
-                    selected_at, quarantined_at, scraped_at, analyzed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    selected_at, quarantined_at, scraped_at, analyzed_at,
+                    is_available, unavailable_reason, availability_checked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item["external_id"],
                     item.get("source", "Import"),
                     item["url"],
                     item["title"],
+                    item.get("transaction_type", "buy"),
                     item.get("property_type", "Autre"),
                     int(item.get("price", 0)),
                     float(item.get("surface", 0.0)),
                     int(item.get("rooms", 0)),
+                    imp_bedrooms,
                     canon_city,
                     item.get("postal_code", ""),
                     imp_desc,
@@ -718,6 +895,9 @@ def import_db_from_json(json_str: str) -> int:
                     item.get("quarantined_at"),
                     item.get("scraped_at"),
                     item.get("analyzed_at"),
+                    1 if item.get("is_available") is None else int(bool(item.get("is_available"))),
+                    str(item.get("unavailable_reason") or ""),
+                    item.get("availability_checked_at"),
                 ),
             )
             restored += 1

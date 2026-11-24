@@ -1,12 +1,15 @@
+import concurrent.futures
 import difflib
 import hashlib
 import json
+import os
 import random
 import re
+import threading
 import time
 import unicodedata
 import urllib.parse
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import httpx
 from bs4 import BeautifulSoup
 
@@ -16,6 +19,19 @@ try:
 except (ImportError, ModuleNotFoundError):
     cffi_requests = None
     HAS_CURL_CFFI = False
+
+_THREAD_LOCAL = threading.local()
+
+
+def _get_thread_cffi_session() -> Optional[Any]:
+    """Réutilise une session HTTP/2 TLS Keep-Alive curl_cffi par thread pour accélérer les requêtes successives."""
+    if not HAS_CURL_CFFI or cffi_requests is None:
+        return None
+    sess = getattr(_THREAD_LOCAL, "cffi_session", None)
+    if sess is None:
+        sess = cffi_requests.Session(impersonate="chrome")
+        _THREAD_LOCAL.cffi_session = sess
+    return sess
 
 CITY_TYPO_FIXES = {
     "bareoul": "baroeul",
@@ -206,6 +222,17 @@ def get_browser_headers(accept_json: bool = False) -> Dict[str, str]:
 
 DEFAULT_HEADERS = get_browser_headers(accept_json=False)
 
+STRONG_PARKING_KEYWORDS = [
+    "garage",
+    "box",
+    "carport",
+    "parking priv",
+    "stationnement priv",
+    "place de parking",
+    "place de parc",
+    "2 places de parking",
+]
+
 PARKING_KEYWORDS = [
     "garage",
     "box",
@@ -216,23 +243,37 @@ PARKING_KEYWORDS = [
     "stationner",
 ]
 
-NO_PARKING_KEYWORDS = [
+STRICT_NO_PARKING_KEYWORDS = [
     "sans garage",
     "pas de garage",
+    "aucun garage",
     "sans parking",
     "pas de parking",
+    "aucun stationnement priv",
+]
+
+STREET_PARKING_KEYWORDS = [
     "stationnement dans la rue",
     "parking facile dans la rue",
+    "stationnement facile dans la rue",
+    "stationnement gratuit dans la rue",
 ]
 
 
 def _detect_parking_in_text(text: str, explicit_flag: Optional[bool] = None) -> bool:
-    """Détecte la présence d'un stationnement privatif (garage/box/parking) sans faux positif."""
+    """
+    Détecte la présence d'un stationnement privatif (garage/box/parking) sans faux négatif
+    lorsqu'une annonce mentionne à la fois un garage ET du stationnement facile dans la rue.
+    """
     text_lower = (text or "").lower()
-    if any(neg in text_lower for neg in NO_PARKING_KEYWORDS):
+    if any(neg in text_lower for neg in STRICT_NO_PARKING_KEYWORDS):
         return False
     if explicit_flag is True:
         return True
+    if any(strong in text_lower for strong in STRONG_PARKING_KEYWORDS):
+        return True
+    if any(street in text_lower for street in STREET_PARKING_KEYWORDS):
+        return False
     return any(kw in text_lower for kw in PARKING_KEYWORDS)
 
 
@@ -276,19 +317,19 @@ def robust_http_get(
     req_headers = get_browser_headers(accept_json=accept_json)
     req_headers["Referer"] = _infer_referer(url)
 
+    cffi_sess = _get_thread_cffi_session()
     for attempt in range(max_retries + 1):
-        # 1. Priorité à curl_cffi (empreinte TLS JA3/JA4 Chrome native, idéal sur Streamlit Cloud face à DataDome/Cloudflare)
-        if HAS_CURL_CFFI and cffi_requests is not None:
+        # 1. Priorité à la session curl_cffi Keep-Alive (empreinte TLS JA3/JA4 Chrome native + HTTP/2 multiplexing)
+        if cffi_sess is not None:
             try:
-                cffi_resp = cffi_requests.get(
+                cffi_resp = cffi_sess.get(
                     url,
-                    impersonate="chrome",
                     headers=req_headers,
                     verify=False,
-                    timeout=14,
+                    timeout=12,
                     allow_redirects=True,
                 )
-                if cffi_resp.status_code == 200:
+                if cffi_resp.status_code in (200, 404, 410):
                     return cffi_resp
                 if cffi_resp.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
                     time.sleep(backoff * (attempt + 1))
@@ -317,7 +358,8 @@ def robust_http_get(
 def fetch_page_content_playwright(url: str, timeout: float = 16.0) -> Optional[str]:
     """
     Fallback anti-WAF / anti-bot : utilise un vrai navigateur Chromium headless via Playwright
-    pour contourner les challenges JS / Captcha DataDome / Cloudflare si la requête HTTP simple est bloquée.
+    (ou Microsoft Edge / Google Chrome système si le binaire Playwright n'est pas installé)
+    si la requête HTTP simple échoue.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -326,14 +368,24 @@ def fetch_page_content_playwright(url: str, timeout: float = 16.0) -> Optional[s
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
-            )
+            browser = None
+            launch_args = [
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ]
+            for chan in (None, "msedge", "chrome"):
+                try:
+                    if chan:
+                        browser = p.chromium.launch(channel=chan, headless=True, args=launch_args)
+                    else:
+                        browser = p.chromium.launch(headless=True, args=launch_args)
+                    break
+                except Exception:
+                    continue
+            if not browser:
+                return None
+
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 viewport={"width": 1366, "height": 768},
@@ -356,6 +408,134 @@ def _clean_html_text(raw_html: str) -> str:
     text = re.sub(r"<br\s*/?>", "\n", raw_html, flags=re.IGNORECASE)
     text = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
     return re.sub(r"\s+", " ", text).strip()
+
+
+_UNAVAILABLE_EXACT_TAGS = {
+    "vendu",
+    "vendue",
+    "sous compromis",
+    "sous offre",
+    "sous option",
+    "réservé",
+    "réservée",
+    "reserve",
+    "reservee",
+    "indisponible",
+    "expiré",
+    "expirée",
+    "expire",
+    "expiree",
+    "clôturé",
+    "clôturée",
+    "sold",
+    "under_offer",
+}
+
+_UNAVAILABLE_RULES: List[Tuple[re.Pattern, str]] = [
+    (re.compile(r"\bsous\s+compromis\b", re.IGNORECASE), "Bien sous compromis"),
+    (
+        re.compile(r"\bcompromis\s+(?:de\s+vente\s+)?(?:sign[eé]|en\s+cours|accept[eé])\b", re.IGNORECASE),
+        "Bien sous compromis",
+    ),
+    (re.compile(r"\bsous\s+offre\b", re.IGNORECASE), "Bien sous offre"),
+    (
+        re.compile(r"\boffre\s+(?:d'achat\s+)?(?:accept[eé]e|en\s+cours|valid[eé]e)\b", re.IGNORECASE),
+        "Bien sous offre",
+    ),
+    (re.compile(r"\bsous\s+option\b", re.IGNORECASE), "Bien sous option"),
+    (
+        re.compile(r"\boption\s+d'achat\s+(?:en\s+cours|accept[eé]e)\b", re.IGNORECASE),
+        "Bien sous option",
+    ),
+    (re.compile(r"\bd[eé]j[aà]\s+vendue?\b", re.IGNORECASE), "Bien déjà vendu"),
+    (re.compile(r"\ba\s+trouv[eé]\s+(?:son\s+|un\s+)?preneur\b", re.IGNORECASE), "Bien déjà vendu"),
+    (re.compile(r"\b(?:c'est\s+)?trop\s+tard\b", re.IGNORECASE), "Bien déjà vendu"),
+    (
+        re.compile(
+            r"\bvendue?\s+(?:en\s+\d+\s*(?:visite|jour|semaine|heure)s?|par\s+(?:notre\s+agence|l'agence|nos\s+soins|orpi|iad|safti|citya|century|era|guy\s+hoquet|square\s+habitat|lafor[eê]t|st[eé]phane\s+plaza|foncia|nexity)|gr[aâ]ce\s+[aà])\b",
+            re.IGNORECASE,
+        ),
+        "Bien déjà vendu",
+    ),
+    (re.compile(r"\bvendue?\s*!", re.IGNORECASE), "Bien déjà vendu"),
+    (
+        re.compile(
+            r"\b(?:ce\s+bien|cette\s+maison|cet\s+appartement|l'appartement|la\s+maison)\s+(?:est|a\s+[eé]t[eé])\s+vendue?\b(?!\s+(?:lou[eé]e?|libre|vide|meubl[eé]e?|non\s+meubl[eé]e?|en\s+l'[eé]tat|en\s+viager|occup[eé]e?|avec))",
+            re.IGNORECASE,
+        ),
+        "Bien déjà vendu",
+    ),
+    (
+        re.compile(
+            r"\bbien\s+vendue?\b(?!\s+(?:lou[eé]e?|libre|vide|meubl[eé]e?|non\s+meubl[eé]e?|en\s+l'[eé]tat|en\s+viager|occup[eé]e?|avec))",
+            re.IGNORECASE,
+        ),
+        "Bien déjà vendu",
+    ),
+    (
+        re.compile(
+            r"(?:^|[\n\r])\s*[_\-\*\[\(★⭐🔥✅❌🔴🟢•|/]*\s*vendue?\b(?!\s+(?:lou[eé]e?|libre|vide|meubl[eé]e?|non\s+meubl[eé]e?|en\s+l'[eé]tat|en\s+viager|occup[eé]e?|avec\s+(?:un|une|des|son|sa|ses|garage|parking|box|jardin|locataire|terrain|cave|meuble|cuisine|travaux|permis|\d)))",
+            re.IGNORECASE,
+        ),
+        "Bien déjà vendu",
+    ),
+    (
+        re.compile(
+            r"\b(?:n'est\s+plus\s+disponible|plus\s+disponible|bien\s+indisponible|annonce\s+(?:expir[eé]e|retir[eé]e|d[eé]sactiv[eé]e|cl[oô]tur[eé]e))\b",
+            re.IGNORECASE,
+        ),
+        "Annonce plus disponible",
+    ),
+    (
+        re.compile(
+            r"\b(?:bien|maison|appartement|logement)\s+(?:d[eé]j[aà]\s+)?r[eé]serv[eé]e?\b|\bd[eé]j[aà]\s+r[eé]serv[eé]e?\b|(?:^|[\n\r])\s*[_\-\*\[\(]*\s*r[eé]serv[eé]e?\s*!",
+            re.IGNORECASE,
+        ),
+        "Bien réservé",
+    ),
+]
+
+_RENT_UNAVAILABLE_RE = re.compile(r"\bd[eé]j[aà]\s+lou[eé]e?\b", re.IGNORECASE)
+
+
+def detect_unavailable_reason(
+    title: str,
+    description: str,
+    tags: Optional[List[str]] = None,
+    tx_type: str = "buy",
+) -> Optional[str]:
+    """
+    Détecte de façon fiable si une annonce indique un bien vendu, sous compromis,
+    sous offre/option, réservé ou retiré, sans faux positifs sur 'vendu loué',
+    'vendu libre' ou 'sans compromis'.
+    """
+    for raw_tag in (tags or []):
+        tag_norm = str(raw_tag or "").replace("’", "'").strip().lower()
+        if tag_norm in _UNAVAILABLE_EXACT_TAGS:
+            if "compromis" in tag_norm:
+                return "Bien sous compromis"
+            if "offre" in tag_norm or tag_norm == "under_offer":
+                return "Bien sous offre"
+            if "option" in tag_norm:
+                return "Bien sous option"
+            if "vendu" in tag_norm or tag_norm == "sold":
+                return "Bien déjà vendu"
+            if "serv" in tag_norm:
+                return "Bien réservé"
+            return "Annonce plus disponible"
+
+    is_rent = str(tx_type or "buy").strip().lower() in ("rent", "location")
+    fields = [title or "", description or ""]
+    for raw_field in fields:
+        field_norm = raw_field.replace("’", "'")
+        if not field_norm.strip():
+            continue
+        for rx, reason in _UNAVAILABLE_RULES:
+            if rx.search(field_norm):
+                return reason
+        if is_rent and _RENT_UNAVAILABLE_RE.search(field_norm):
+            return "Bien déjà loué"
+    return None
 
 
 def _format_agency_source(ad_id: str, account_name: str = "") -> str:
@@ -404,15 +584,32 @@ def resolve_bienici_zone_id(client: httpx.Client, city_name: str) -> List[str]:
     return []
 
 
-def scrape_bienici_live(criteria: Dict[str, Any], limit_per_city: int = 15, timeout: float = 12.0) -> List[Dict[str, Any]]:
+def _extract_bedrooms_from_text(text: str, rooms: int = 0) -> int:
+    """Extrait le nombre de chambres mentionné dans la description ou l'estime à défaut."""
+    if not text:
+        return max(0, rooms - 1) if rooms >= 2 else 0
+    m = re.search(r"\b(\d+)\s*chambres?\b", text, re.IGNORECASE)
+    if m:
+        val = int(m.group(1))
+        if 0 < val <= 15:
+            return val
+    return 0
+
+
+def scrape_bienici_live(criteria: Dict[str, Any], limit_per_city: Optional[int] = None, timeout: float = 12.0) -> List[Dict[str, Any]]:
     """
     Scrape en temps réel l'agrégateur Bien'ici (qui regroupe IAD, Safti, Citya, Square Habitat,
-    Guy Hoquet, ERA, Sergic et agences indépendantes de la métropole lilloise) ville par ville.
+    Guy Hoquet, ERA, Sergic et agences indépendantes de la métropole lilloise) ville par ville,
+    avec pagination complète sans limite de 15 annonces.
     """
     results: List[Dict[str, Any]] = []
     seen_ids = set()
-    max_budget = int(criteria.get("max_budget", 280000))
+    tx_type = "rent" if str(criteria.get("transaction_type", "buy")).strip().lower() in ("rent", "location") else "buy"
+    min_price_floor = 250 if tx_type == "rent" else 70000
+    max_budget = int(criteria.get("max_budget", 1500 if tx_type == "rent" else 280000))
     min_surface = float(criteria.get("min_surface", 80.0))
+    min_rooms = int(criteria.get("min_rooms", 0) or 0)
+    min_bedrooms = int(criteria.get("min_bedrooms", 0) or 0)
     cities = criteria.get("cities", list(CITY_METADATA.keys()))
 
     prop_types_map = []
@@ -424,6 +621,9 @@ def scrape_bienici_live(criteria: Dict[str, Any], limit_per_city: int = 15, time
     if not prop_types_map:
         prop_types_map = ["house", "flat"]
 
+    page_size = 100 if not limit_per_city else min(100, int(limit_per_city))
+    max_pages = 15  # Jusqu'à 1500 annonces par ville
+
     headers = get_browser_headers(accept_json=True)
     with httpx.Client(headers=headers, timeout=timeout, follow_redirects=True, verify=False) as client:
         for city in cities:
@@ -431,143 +631,200 @@ def scrape_bienici_live(criteria: Dict[str, Any], limit_per_city: int = 15, time
             if not zone_ids:
                 continue
 
-            filters = {
-                "size": limit_per_city,
-                "from": 0,
-                "showAllModels": False,
-                "filterType": "buy",
-                "propertyType": prop_types_map,
-                "minPrice": 70000,
-                "maxPrice": max_budget,
-                "minArea": min_surface,
-                "sortBy": "publicationDate",
-                "sortOrder": "desc",
-                "zoneIdsByTypes": {"zoneIds": zone_ids},
-            }
-            url = "https://www.bienici.com/realEstateAds.json?filters=" + urllib.parse.quote(json.dumps(filters))
-            try:
-                resp = robust_http_get(client, url, max_retries=2)
-                data = None
-                if resp and resp.status_code == 200:
-                    data = resp.json()
-                elif not resp or resp.status_code in (403, 429):
-                    pw_html = fetch_page_content_playwright(url, timeout=timeout)
-                    if pw_html:
-                        soup = BeautifulSoup(pw_html, "html.parser")
-                        pre = soup.find("pre")
-                        if pre and pre.text:
-                            data = json.loads(pre.text)
+            city_count = 0
+            offset = 0
+            for _ in range(max_pages):
+                filters: Dict[str, Any] = {
+                    "size": page_size,
+                    "from": offset,
+                    "showAllModels": False,
+                    "filterType": tx_type,
+                    "propertyType": prop_types_map,
+                    "minPrice": min_price_floor,
+                    "maxPrice": max_budget,
+                    "minArea": min_surface,
+                    "onTheMarket": [True],
+                    "sortBy": "publicationDate",
+                    "sortOrder": "desc",
+                    "zoneIdsByTypes": {"zoneIds": zone_ids},
+                }
+                if min_rooms > 0:
+                    filters["minRooms"] = min_rooms
+                if min_bedrooms > 0:
+                    filters["minBedrooms"] = min_bedrooms
 
-                if not data:
-                    continue
+                url = "https://www.bienici.com/realEstateAds.json?filters=" + urllib.parse.quote(json.dumps(filters))
+                try:
+                    resp = robust_http_get(client, url, max_retries=2)
+                    data = None
+                    if resp and resp.status_code == 200:
+                        data = resp.json()
+                    elif not resp or resp.status_code in (403, 429):
+                        pw_html = fetch_page_content_playwright(url, timeout=timeout)
+                        if pw_html:
+                            soup = BeautifulSoup(pw_html, "html.parser")
+                            pre = soup.find("pre")
+                            if pre and pre.text:
+                                data = json.loads(pre.text)
 
-                for ad in data.get("realEstateAds", []):
-                    ad_id = str(ad.get("id", "")).strip()
-                    if not ad_id or ad_id in seen_ids:
-                        continue
+                    if not data:
+                        break
 
-                    prop_type = "Maison" if ad.get("propertyType") == "house" else "Appartement"
-                    if prop_type.lower() not in selected_types:
-                        continue
+                    ads_batch = data.get("realEstateAds") or []
+                    if not ads_batch:
+                        break
 
-                    ad_city = _canonical_city_name(str(ad.get("city") or city).strip(), cities)
-                    if not _city_matches_targets(ad_city, cities):
-                        continue
+                    for ad in ads_batch:
+                        ad_id = str(ad.get("id", "")).strip()
+                        if not ad_id or ad_id in seen_ids:
+                            continue
 
-                    seen_ids.add(ad_id)
-                    city_meta = _get_city_meta(ad_city)
-                    postal_code = str(ad.get("postalCode") or city_meta.get("postal_code", "59000"))
-                    rooms = int(ad.get("roomsQuantity") or 0)
-                    surface = float(ad.get("surfaceArea") or 0.0)
-                    price = int(ad.get("price") or 0)
-                    if price < 70000 or price > max_budget or surface < min_surface:
-                        continue
+                        if ad.get("isSold") is True or ad.get("sold") is True:
+                            continue
+                        ad_status = ad.get("status")
+                        if isinstance(ad_status, dict) and (
+                            ad_status.get("onTheMarket") is False or ad_status.get("closedByUser") is True
+                        ):
+                            continue
 
-                    raw_desc = _clean_html_text(ad.get("description") or "")
+                        prop_type = "Maison" if ad.get("propertyType") == "house" else "Appartement"
+                        if prop_type.lower() not in selected_types:
+                            continue
 
-                    extra_meta = []
-                    if ad.get("bedroomsQuantity"):
-                        extra_meta.append(f"{ad.get('bedroomsQuantity')} chambres")
-                    if ad.get("hasTerrace"):
-                        extra_meta.append("Terrasse")
-                    if ad.get("hasGarden"):
-                        extra_meta.append("Jardin")
-                    if ad.get("hasCellar"):
-                        extra_meta.append("Cave")
-                    if ad.get("isCondominiumInProcedure") is True:
-                        extra_meta.append("Procédure de copropriété en cours")
-                    elif ad.get("isCondominiumInProcedure") is False:
-                        extra_meta.append("Aucune procédure en cours")
-                    if ad.get("workToDo"):
-                        extra_meta.append("Travaux à prévoir")
+                        ad_city = _canonical_city_name(str(ad.get("city") or city).strip(), cities)
+                        if not _city_matches_targets(ad_city, cities):
+                            continue
 
-                    full_desc = raw_desc
-                    if extra_meta:
-                        full_desc += f" [Infos techniques : {', '.join(extra_meta)}]"
+                        city_meta = _get_city_meta(ad_city)
+                        postal_code = str(ad.get("postalCode") or city_meta.get("postal_code", "59000"))
+                        rooms = int(ad.get("roomsQuantity") or 0)
+                        raw_desc = _clean_html_text(ad.get("description") or "")
+                        bedrooms = int(ad.get("bedroomsQuantity") or 0)
+                        if bedrooms == 0:
+                            bedrooms = _extract_bedrooms_from_text(raw_desc, rooms)
 
-                    account_name = str(ad.get("accountDisplayName") or "").strip()
-                    title = (ad.get("title") or "").strip()
-                    if not title or len(title) < 10:
-                        raw_dist = ad.get("displayDistrictName")
-                        district = f" ({raw_dist.strip()})" if isinstance(raw_dist, str) and raw_dist.strip() else ""
-                        title = f"{prop_type} {rooms} pièces {surface:g} m² - {ad_city}{district}"
+                        surface = float(ad.get("surfaceArea") or 0.0)
+                        price = int(ad.get("price") or 0)
+                        if price < min_price_floor or price > max_budget or surface < min_surface:
+                            continue
+                        if min_rooms > 0 and rooms > 0 and rooms < min_rooms:
+                            continue
+                        if min_bedrooms > 0 and bedrooms > 0 and bedrooms < min_bedrooms:
+                            continue
 
-                    has_parking_json = bool(
-                        ad.get("hasParking") or ad.get("hasGarage") or (ad.get("parkingPlacesQuantity") or 0) > 0
-                    )
-                    has_parking = _detect_parking_in_text(f"{title} {full_desc}", explicit_flag=has_parking_json)
+                        seen_ids.add(ad_id)
 
-                    dpe = str(ad.get("energyClassification") or "Non renseigné").strip().upper()
-                    if dpe not in ("A", "B", "C", "D", "E", "F", "G"):
-                        m_dpe = re.search(r"\bdpe\s*[:\-]?\s*([a-g])\b", f"{title} {full_desc}", re.IGNORECASE)
-                        dpe = m_dpe.group(1).upper() if m_dpe else "Non renseigné"
+                        extra_meta = []
+                        if bedrooms:
+                            extra_meta.append(f"{bedrooms} chambres")
+                        if ad.get("hasTerrace"):
+                            extra_meta.append("Terrasse")
+                        if ad.get("hasGarden"):
+                            extra_meta.append("Jardin")
+                        if ad.get("hasCellar"):
+                            extra_meta.append("Cave")
+                        if ad.get("isCondominiumInProcedure") is True:
+                            extra_meta.append("Procédure de copropriété en cours")
+                        elif ad.get("isCondominiumInProcedure") is False:
+                            extra_meta.append("Aucune procédure en cours")
+                        if ad.get("workToDo"):
+                            extra_meta.append("Travaux à prévoir")
 
-                    results.append(
-                        {
-                            "external_id": f"bienici-{ad_id}",
-                            "source": _format_agency_source(ad_id, account_name),
-                            "url": f"https://www.bienici.com/annonce/{ad_id}",
-                            "title": title,
-                            "property_type": prop_type,
-                            "price": price,
-                            "surface": surface,
-                            "rooms": rooms,
-                            "city": ad_city,
-                            "postal_code": postal_code,
-                            "description": full_desc or title,
-                            "dpe": dpe,
-                            "has_parking": has_parking,
-                        }
-                    )
-            except Exception:
-                continue
+                        full_desc = raw_desc
+                        if extra_meta:
+                            full_desc += f" [Infos techniques : {', '.join(extra_meta)}]"
+
+                        account_name = str(ad.get("accountDisplayName") or "").strip()
+                        title = (ad.get("title") or "").strip()
+                        if not title or len(title) < 10:
+                            raw_dist = ad.get("displayDistrictName")
+                            district = f" ({raw_dist.strip()})" if isinstance(raw_dist, str) and raw_dist.strip() else ""
+                            title = f"{prop_type} {rooms} pièces {surface:g} m² - {ad_city}{district}"
+
+                        if detect_unavailable_reason(title, full_desc, tx_type=tx_type):
+                            continue
+
+                        has_parking_json = bool(
+                            ad.get("hasParking") or ad.get("hasGarage") or (ad.get("parkingPlacesQuantity") or 0) > 0
+                        )
+                        has_parking = _detect_parking_in_text(f"{title} {full_desc}", explicit_flag=has_parking_json)
+
+                        dpe = str(ad.get("energyClassification") or "Non renseigné").strip().upper()
+                        if dpe not in ("A", "B", "C", "D", "E", "F", "G"):
+                            m_dpe = re.search(r"\bdpe\s*[:\-]?\s*([a-g])\b", f"{title} {full_desc}", re.IGNORECASE)
+                            dpe = m_dpe.group(1).upper() if m_dpe else "Non renseigné"
+
+                        results.append(
+                            {
+                                "external_id": f"bienici-{ad_id}",
+                                "source": _format_agency_source(ad_id, account_name),
+                                "url": f"https://www.bienici.com/annonce/{ad_id}",
+                                "title": title,
+                                "transaction_type": tx_type,
+                                "property_type": prop_type,
+                                "price": price,
+                                "surface": surface,
+                                "rooms": rooms,
+                                "bedrooms": bedrooms,
+                                "city": ad_city,
+                                "postal_code": postal_code,
+                                "description": full_desc or title,
+                                "dpe": dpe,
+                                "has_parking": has_parking,
+                            }
+                        )
+                        city_count += 1
+                        if limit_per_city and city_count >= limit_per_city:
+                            break
+
+                    if limit_per_city and city_count >= limit_per_city:
+                        break
+                    total_available = int(data.get("total") or 0)
+                    offset += len(ads_batch)
+                    if len(ads_batch) < page_size or (total_available > 0 and offset >= total_available):
+                        break
+                except Exception:
+                    break
 
     return results
 
 
 def _fetch_orpi_detail_enrichment(
     client: httpx.Client, ad_url: str
-) -> Tuple[str, str, Optional[str], bool]:
+) -> Tuple[str, str, Optional[str], bool, bool]:
     """
     Récupère sur la fiche détail Orpi :
     - la description intégrale non tronquée (`div.s-cms`)
     - la lettre DPE réelle (`window.dataLayer` `dpe: "1".."7"` ou `li.c-dpe__index--active`)
     - le code postal exact (`codePostal` dans `window.dataLayer`)
     - l'indicateur de parking/garage issu du `dataLayer` (`nbGarage`, `nbParking`, `stationnement`)
+    - l'indicateur d'indisponibilité (HTTP 404/410, redirection hors /annonce-, ou Sold=1)
     """
     full_desc = ""
     dpe = "Non renseigné"
     postal_code: Optional[str] = None
     has_parking_dl = False
+    is_unavailable = False
 
     dpe_num_map = {"1": "A", "2": "B", "3": "C", "4": "D", "5": "E", "6": "F", "7": "G"}
 
     try:
         resp = robust_http_get(client, ad_url, max_retries=1)
-        if not resp or resp.status_code != 200:
-            return full_desc, dpe, postal_code, has_parking_dl
+        if not resp:
+            return full_desc, dpe, postal_code, has_parking_dl, False
+        if resp.status_code in (404, 410):
+            return full_desc, dpe, postal_code, has_parking_dl, True
+        if resp.status_code != 200:
+            return full_desc, dpe, postal_code, has_parking_dl, False
+
+        final_url = str(getattr(resp, "url", ad_url) or ad_url)
+        if "/annonce-" not in final_url.lower():
+            return full_desc, dpe, postal_code, has_parking_dl, True
 
         html = resp.text
+        if re.search(r'\bSold\s*=\s*1\b|"sold"\s*:\s*true|\bisSold\s*:\s*true\b', html, re.IGNORECASE):
+            is_unavailable = True
+
         soup = BeautifulSoup(html, "html.parser")
 
         cms_div = soup.find("div", class_=re.compile(r"\bs-cms\b"))
@@ -600,19 +857,29 @@ def _fetch_orpi_detail_enrichment(
     except Exception:
         pass
 
-    return full_desc, dpe, postal_code, has_parking_dl
+    return full_desc, dpe, postal_code, has_parking_dl, is_unavailable
 
 
-def scrape_orpi_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List[Dict[str, Any]]:
+def scrape_orpi_live(
+    criteria: Dict[str, Any],
+    timeout: float = 12.0,
+    existing_orpi_cache: Optional[Dict[str, Tuple[str, str, str, Optional[int]]]] = None,
+) -> List[Dict[str, Any]]:
     """
     Scrape en temps réel les annonces des agences Orpi de la métropole lilloise
-    via l'attribut JSON `data-result` des pages de recherche Orpi et enrichit chaque annonce
-    éligible avec sa fiche détail (description complète, DPE officiel, parking, code postal).
+    via l'attribut JSON `data-result` des pages de recherche Orpi et enrichit en parallèle
+    chaque nouvelle annonce éligible avec sa fiche détail (en réutilisant le cache SQLite
+    pour les annonces déjà connues).
     """
     results: List[Dict[str, Any]] = []
     seen_refs = set()
-    max_budget = int(criteria.get("max_budget", 280000))
+    orpi_cache = existing_orpi_cache or {}
+    tx_type = "rent" if str(criteria.get("transaction_type", "buy")).strip().lower() in ("rent", "location") else "buy"
+    min_price_floor = 250 if tx_type == "rent" else 70000
+    max_budget = int(criteria.get("max_budget", 1500 if tx_type == "rent" else 280000))
     min_surface = float(criteria.get("min_surface", 80.0))
+    min_rooms = int(criteria.get("min_rooms", 0) or 0)
+    min_bedrooms = int(criteria.get("min_bedrooms", 0) or 0)
     cities = criteria.get("cities", list(CITY_METADATA.keys()))
     selected_types = [t.lower() for t in criteria.get("property_types", ["Maison", "Appartement"])]
 
@@ -623,35 +890,21 @@ def scrape_orpi_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List[Di
         type_params.append(f"realEstateTypes[{len(type_params)}]=appartement")
     type_query = ("&" + "&".join(type_params)) if type_params else ""
 
-    # Construire une requête multi-villes + les requêtes unitaires pour maximiser la couverture Orpi
-    orpi_slugs = []
-    for city in cities:
-        meta = _get_city_meta(city)
-        slug = meta.get("orpi_slug") or _normalize_city(city).replace(" ", "-")
-        if slug and slug not in orpi_slugs:
-            orpi_slugs.append(slug)
+    orpi_endpoint = "rent" if tx_type == "rent" else "buy"
+    orpi_ad_prefix = "annonce-location-" if tx_type == "rent" else "annonce-vente-"
 
     urls_to_fetch: List[Tuple[str, str]] = []
-    if len(orpi_slugs) > 1:
-        multi_loc = "&".join(
-            f"locations[{i}][value]={urllib.parse.quote(s)}" for i, s in enumerate(orpi_slugs)
-        )
-        urls_to_fetch.append(
-            (
-                cities[0],
-                f"https://www.orpi.com/recherche/buy?{multi_loc}{type_query}",
-            )
-        )
     for city in cities:
         meta = _get_city_meta(city)
         orpi_slug = meta.get("orpi_slug") or _normalize_city(city).replace(" ", "-")
         urls_to_fetch.append(
             (
                 city,
-                f"https://www.orpi.com/recherche/buy?locations[0][value]={urllib.parse.quote(orpi_slug)}{type_query}",
+                f"https://www.orpi.com/recherche/{orpi_endpoint}?locations[0][value]={urllib.parse.quote(orpi_slug)}{type_query}&maxPrice={max_budget}&minSurface={int(min_surface)}",
             )
         )
 
+    raw_candidates_to_enrich: List[Dict[str, Any]] = []
     headers = get_browser_headers(accept_json=False)
     with httpx.Client(headers=headers, timeout=timeout, follow_redirects=True, verify=False) as client:
         for city, url in urls_to_fetch:
@@ -679,6 +932,13 @@ def scrape_orpi_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List[Di
                     if not slug or not ref or ref in seen_refs:
                         continue
 
+                    if item.get("sold") is True or item.get("isSold") is True or item.get("enabled") is False:
+                        continue
+                    item_short_ad = _clean_html_text(str(item.get("longAd") or ""))
+                    item_tags = [str(t) for t in (item.get("tags") or [])]
+                    if detect_unavailable_reason("", item_short_ad, tags=item_tags, tx_type=tx_type):
+                        continue
+
                     raw_type = str(item.get("type") or "").lower()
                     prop_type = "Maison" if "maison" in raw_type else "Appartement"
                     if selected_types and prop_type.lower() not in selected_types:
@@ -686,7 +946,7 @@ def scrape_orpi_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List[Di
 
                     price = int(item.get("price") or 0)
                     surface = float(item.get("surface") or 0.0)
-                    if price < 70000 or price > max_budget or surface < min_surface:
+                    if price < min_price_floor or price > max_budget or surface < min_surface:
                         continue
 
                     raw_city = item.get("city")
@@ -699,73 +959,128 @@ def scrape_orpi_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List[Di
                     if not _city_matches_targets(ad_city, cities):
                         continue
 
-                    seen_refs.add(ref)
-
-                    raw_district = item.get("district")
-                    if isinstance(raw_district, dict):
-                        district_name = str(raw_district.get("name") or "").strip()
-                    else:
-                        district_name = str(raw_district or "").strip()
-
                     rooms = int(item.get("nbRooms") or 0)
-                    short_ad = _clean_html_text(str(item.get("longAd") or ""))
-                    tags = [str(t) for t in (item.get("tags") or [])]
-                    if item.get("isLifeAnnuity"):
-                        tags.append("Viager")
-                    if item.get("isRentalInvestment"):
-                        tags.append("Investissement locatif / Vendu loué")
+                    if min_rooms > 0 and rooms > 0 and rooms < min_rooms:
+                        continue
 
-                    ad_url = f"https://www.orpi.com/annonce-vente-{slug}/"
-                    detail_desc, detail_dpe, detail_cp, has_parking_dl = _fetch_orpi_detail_enrichment(client, ad_url)
-
-                    full_desc = detail_desc if len(detail_desc) > len(short_ad) else short_ad
-                    if tags:
-                        full_desc += f" [Tags Orpi : {', '.join(tags)}]"
-
-                    raw_item_dpe = str(item.get("dpe") or "").strip().upper()
-                    if raw_item_dpe in ("A", "B", "C", "D", "E", "F", "G"):
-                        dpe = raw_item_dpe
-                    elif detail_dpe in ("A", "B", "C", "D", "E", "F", "G"):
-                        dpe = detail_dpe
-                    else:
-                        m_dpe = re.search(r"\bdpe\s*[:\-]?\s*([a-g])\b", full_desc, re.IGNORECASE)
-                        dpe = m_dpe.group(1).upper() if m_dpe else "Non renseigné"
-
-                    district_suffix = f" ({district_name})" if district_name else ""
-                    title = f"{prop_type} {rooms} pièces {surface:g} m² - {ad_city}{district_suffix}"
-
-                    has_parking_tags = any(
-                        any(w in t.lower() for w in PARKING_KEYWORDS) for t in tags
-                    )
-                    has_parking = _detect_parking_in_text(
-                        f"{title} {full_desc}",
-                        explicit_flag=(has_parking_dl or has_parking_tags),
-                    )
-
-                    agency_info = item.get("agency") or {}
-                    agency_name = agency_info.get("name") if isinstance(agency_info, dict) else "Orpi"
-                    ad_city_meta = _get_city_meta(ad_city)
-                    postal_code = detail_cp or ad_city_meta.get("postal_code", "59000")
-
-                    results.append(
+                    seen_refs.add(ref)
+                    raw_candidates_to_enrich.append(
                         {
-                            "external_id": f"orpi-{ref}",
-                            "source": f"Orpi ({agency_name})" if agency_name else "Orpi",
-                            "url": ad_url,
-                            "title": title,
-                            "property_type": prop_type,
+                            "item": item,
+                            "slug": slug,
+                            "ref": ref,
+                            "prop_type": prop_type,
                             "price": price,
                             "surface": surface,
                             "rooms": rooms,
-                            "city": ad_city,
-                            "postal_code": postal_code,
-                            "description": full_desc or f"Annonce Orpi {slug}",
-                            "dpe": dpe,
-                            "has_parking": has_parking,
+                            "ad_city": ad_city,
                         }
                     )
             except Exception:
                 continue
+
+        # Enrichissement parallèle des fiches détails Orpi (avec court-circuit sur le cache SQLite)
+        def _enrich_candidate(cand: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            item = cand["item"]
+            slug = cand["slug"]
+            ref = cand["ref"]
+            prop_type = cand["prop_type"]
+            price = cand["price"]
+            surface = cand["surface"]
+            rooms = cand["rooms"]
+            ad_city = cand["ad_city"]
+            ext_id = f"orpi-{ref}"
+            ad_url = f"https://www.orpi.com/{orpi_ad_prefix}{slug}/"
+
+            raw_district = item.get("district")
+            if isinstance(raw_district, dict):
+                district_name = str(raw_district.get("name") or "").strip()
+            else:
+                district_name = str(raw_district or "").strip()
+
+            short_ad = _clean_html_text(str(item.get("longAd") or ""))
+            tags = [str(t) for t in (item.get("tags") or [])]
+            if item.get("isLifeAnnuity"):
+                tags.append("Viager")
+            if item.get("isRentalInvestment"):
+                tags.append("Investissement locatif / Vendu loué")
+
+            cached = orpi_cache.get(ext_id)
+            if cached and len(cached[0]) > len(short_ad) + 40 and cached[1] in ("A", "B", "C", "D", "E", "F", "G"):
+                detail_desc, detail_dpe, detail_cp, has_parking_dl = (
+                    cached[0],
+                    cached[1],
+                    cached[2] or None,
+                    bool(cached[3]),
+                )
+                detail_unavailable = False
+            else:
+                detail_desc, detail_dpe, detail_cp, has_parking_dl, detail_unavailable = _fetch_orpi_detail_enrichment(
+                    client, ad_url
+                )
+
+            if detail_unavailable:
+                return None
+
+            full_desc = detail_desc if len(detail_desc) > len(short_ad) else short_ad
+            if tags and "[Tags Orpi :" not in full_desc:
+                full_desc += f" [Tags Orpi : {', '.join(tags)}]"
+
+            bedrooms = int(item.get("nbBedrooms") or 0)
+            if bedrooms == 0:
+                bedrooms = _extract_bedrooms_from_text(full_desc, rooms)
+            if min_bedrooms > 0 and bedrooms > 0 and bedrooms < min_bedrooms:
+                return None
+
+            raw_item_dpe = str(item.get("dpe") or "").strip().upper()
+            if raw_item_dpe in ("A", "B", "C", "D", "E", "F", "G"):
+                dpe = raw_item_dpe
+            elif detail_dpe in ("A", "B", "C", "D", "E", "F", "G"):
+                dpe = detail_dpe
+            else:
+                m_dpe = re.search(r"\bdpe\s*[:\-]?\s*([a-g])\b", full_desc, re.IGNORECASE)
+                dpe = m_dpe.group(1).upper() if m_dpe else "Non renseigné"
+
+            district_suffix = f" ({district_name})" if district_name else ""
+            title = f"{prop_type} {rooms} pièces {surface:g} m² - {ad_city}{district_suffix}"
+
+            if detect_unavailable_reason(title, full_desc, tags=tags, tx_type=tx_type):
+                return None
+
+            has_parking_tags = any(any(w in t.lower() for w in PARKING_KEYWORDS) for t in tags)
+            has_parking = _detect_parking_in_text(
+                f"{title} {full_desc}",
+                explicit_flag=(has_parking_dl or has_parking_tags),
+            )
+
+            agency_info = item.get("agency") or {}
+            agency_name = agency_info.get("name") if isinstance(agency_info, dict) else "Orpi"
+            ad_city_meta = _get_city_meta(ad_city)
+            postal_code = detail_cp or ad_city_meta.get("postal_code", "59000")
+
+            return {
+                "external_id": ext_id,
+                "source": f"Orpi ({agency_name})" if agency_name else "Orpi",
+                "url": ad_url,
+                "title": title,
+                "transaction_type": tx_type,
+                "property_type": prop_type,
+                "price": price,
+                "surface": surface,
+                "rooms": rooms,
+                "bedrooms": bedrooms,
+                "city": ad_city,
+                "postal_code": postal_code,
+                "description": full_desc or f"Annonce Orpi {slug}",
+                "dpe": dpe,
+                "has_parking": has_parking,
+            }
+
+        if raw_candidates_to_enrich:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                for enriched in pool.map(_enrich_candidate, raw_candidates_to_enrich):
+                    if enriched is not None:
+                        results.append(enriched)
 
     return results
 
@@ -815,8 +1130,12 @@ def scrape_seloger_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List
     """
     results: List[Dict[str, Any]] = []
     seen_ids = set()
-    max_budget = int(criteria.get("max_budget", 280000))
+    tx_type = "rent" if str(criteria.get("transaction_type", "buy")).strip().lower() in ("rent", "location") else "buy"
+    min_price_floor = 250 if tx_type == "rent" else 70000
+    max_budget = int(criteria.get("max_budget", 1500 if tx_type == "rent" else 280000))
     min_surface = float(criteria.get("min_surface", 80.0))
+    min_rooms = int(criteria.get("min_rooms", 0) or 0)
+    min_bedrooms = int(criteria.get("min_bedrooms", 0) or 0)
     cities = criteria.get("cities", list(CITY_METADATA.keys()))
 
     estate_types = []
@@ -828,6 +1147,13 @@ def scrape_seloger_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List
     if not estate_types:
         estate_types = ["House", "Apartment"]
 
+    dist_type = "Rent" if tx_type == "rent" else "Buy"
+    extra_seloger_params = ""
+    if min_rooms > 0:
+        extra_seloger_params += f"&nbOfRoomsMin={min_rooms}"
+    if min_bedrooms > 0:
+        extra_seloger_params += f"&nbOfBedroomsMin={min_bedrooms}"
+
     seloger_headers = get_browser_headers(accept_json=False)
 
     with httpx.Client(headers=seloger_headers, timeout=timeout, follow_redirects=True, verify=False) as client:
@@ -836,171 +1162,624 @@ def scrape_seloger_live(criteria: Dict[str, Any], timeout: float = 12.0) -> List
             if not place_id:
                 continue
 
-            url = (
-                f"https://www.seloger.com/classified-search?"
-                f"distributionTypes=Buy&estateTypes={','.join(estate_types)}"
-                f"&locations={place_id}&priceMin=70000&priceMax={max_budget}&spaceMin={int(min_surface)}"
-            )
-            try:
-                resp = robust_http_get(client, url, max_retries=1)
-                html_text = ""
-                used_playwright = False
-                if resp and resp.status_code == 200:
-                    html_text = resp.text
-                elif not resp or resp.status_code in (403, 429):
-                    html_text = fetch_page_content_playwright(url, timeout=timeout) or ""
-                    used_playwright = True
+            for page_num in range(1, 5):
+                url = (
+                    f"https://www.seloger.com/classified-search?"
+                    f"distributionTypes={dist_type}&estateTypes={','.join(estate_types)}"
+                    f"&locations={place_id}&priceMin={min_price_floor}&priceMax={max_budget}&spaceMin={int(min_surface)}"
+                    f"{extra_seloger_params}&page={page_num}"
+                )
+                try:
+                    resp = robust_http_get(client, url, max_retries=1)
+                    html_text = ""
+                    used_playwright = False
+                    if resp and resp.status_code == 200:
+                        html_text = resp.text
+                    elif (not resp or resp.status_code in (403, 429)) and page_num == 1:
+                        html_text = fetch_page_content_playwright(url, timeout=timeout) or ""
+                        used_playwright = True
 
-                if not html_text:
-                    continue
+                    if not html_text:
+                        break
 
-                soup = BeautifulSoup(html_text, "html.parser")
+                    soup = BeautifulSoup(html_text, "html.parser")
+                    page_new_count = 0
 
-                for s in soup.find_all("script"):
-                    txt = s.string or ""
-                    if "__UFRN_FETCHER__" not in txt:
-                        continue
-                    try:
-                        start = txt.find("JSON.parse(") + len("JSON.parse(")
-                        end = txt.rfind(")")
-                        data = json.loads(json.loads(txt[start:end]))
-                        serp = data.get("data", {}).get("classified-serp-data", {})
-                        cdata = serp.get("classifiedsData", {})
-                    except Exception:
-                        continue
-
-                    if not cdata:
-                        continue
-
-                    enriched_meta = serp.get("enrichedClassifiedsData", {})
-                    suggested_ids = set(str(x) for x in (serp.get("suggestedClassifieds") or []))
-
-                    for ad_id, item in cdata.items():
-                        ad_id_str = str(ad_id).strip()
-                        if not ad_id_str or ad_id_str in seen_ids:
+                    for s in soup.find_all("script"):
+                        txt = s.string or ""
+                        if "__UFRN_FETCHER__" not in txt:
+                            continue
+                        try:
+                            start = txt.find("JSON.parse(") + len("JSON.parse(")
+                            end = txt.rfind(")")
+                            data = json.loads(json.loads(txt[start:end]))
+                            serp = data.get("data", {}).get("classified-serp-data", {})
+                            cdata = serp.get("classifiedsData", {})
+                        except Exception:
                             continue
 
-                        is_suggestion = (
-                            ad_id_str in suggested_ids
-                            or bool((enriched_meta.get(ad_id_str) or {}).get("isSuggestion"))
-                        )
-
-                        raw = item.get("rawData") or {}
-                        price = int(raw.get("price") or 0)
-                        surf_obj = raw.get("surface") or {}
-                        surface = float(surf_obj.get("main") or 0.0)
-                        if price < 70000 or price > max_budget or surface < min_surface:
+                        if not cdata:
                             continue
 
-                        prop_raw = str(raw.get("propertyType") or "").upper()
-                        prop_type = "Maison" if "HOUSE" in prop_raw else "Appartement"
-                        if selected_types and prop_type.lower() not in selected_types:
-                            continue
+                        enriched_meta = serp.get("enrichedClassifiedsData", {})
+                        suggested_ids = set(str(x) for x in (serp.get("suggestedClassifieds") or []))
 
-                        rooms = int(raw.get("nbroom") or 0)
-                        bedrooms = int(raw.get("nbbedroom") or 0)
+                        for ad_id, item in cdata.items():
+                            ad_id_str = str(ad_id).strip()
+                            if not ad_id_str or ad_id_str in seen_ids:
+                                continue
 
-                        loc_addr = (item.get("location") or {}).get("address") or {}
-                        ad_city = _canonical_city_name(str(loc_addr.get("city") or city).strip(), cities)
-                        if is_suggestion and not _city_matches_targets(ad_city, cities):
-                            continue
-                        if not _city_matches_targets(ad_city, cities):
-                            continue
+                            raw = item.get("rawData") or {}
+                            item_status = str(item.get("status") or raw.get("status") or "").strip().upper()
+                            if (
+                                item.get("isSold") is True
+                                or raw.get("isSold") is True
+                                or item_status
+                                in ("SOLD", "INACTIVE", "EXPIRED", "DELETED", "ARCHIVED", "UNAVAILABLE", "CLOSED")
+                            ):
+                                continue
 
-                        seen_ids.add(ad_id_str)
-                        ad_city_meta = _get_city_meta(ad_city)
-                        zip_code = str(loc_addr.get("zipCode") or ad_city_meta.get("postal_code", "59000"))
-                        district = str(loc_addr.get("district") or "").strip()
-
-                        main_desc = item.get("mainDescription") or {}
-                        headline = _clean_html_text(str(main_desc.get("headline") or ""))
-                        desc_body = _clean_html_text(str(main_desc.get("description") or ""))
-
-                        hard_facts = item.get("hardFacts") or {}
-                        keyfacts = [str(kf) for kf in (hard_facts.get("keyfacts") or [])]
-                        if bedrooms and not any("chambre" in kf.lower() for kf in keyfacts):
-                            keyfacts.append(f"{bedrooms} chambres")
-
-                        provider = item.get("provider") or {}
-                        agency_card = provider.get("intermediaryCard") or {}
-                        agency_title = str(agency_card.get("title") or "Agence SeLoger").strip()
-
-                        full_title = (
-                            headline
-                            if len(headline) > 12
-                            else f"{prop_type} {rooms} pièces {surface:g} m² - {ad_city}"
-                        )
-                        if district and district.lower() not in full_title.lower():
-                            full_title += f" ({district})"
-
-                        # Extraction du DPE depuis le champ JSON officiel `energyClass` de SeLoger
-                        raw_energy = str(item.get("energyClass") or "").strip().upper()
-                        if raw_energy in ("A", "B", "C", "D", "E", "F", "G"):
-                            dpe = raw_energy
-                        else:
-                            m_dpe = re.search(
-                                r"\bdpe\s*[:\-]?\s*([a-g])\b",
-                                f"{full_title} {desc_body}",
-                                re.IGNORECASE,
+                            is_suggestion = (
+                                ad_id_str in suggested_ids
+                                or bool((enriched_meta.get(ad_id_str) or {}).get("isSuggestion"))
                             )
-                            dpe = m_dpe.group(1).upper() if m_dpe else "Non renseigné"
 
-                        full_desc = desc_body
-                        if keyfacts:
-                            full_desc += f" [Caractéristiques SeLoger : {', '.join(keyfacts)}]"
-                        if surf_obj.get("plot"):
-                            full_desc += f" [Terrain : {surf_obj.get('plot')} m²]"
-                        if dpe != "Non renseigné":
-                            full_desc += f" [DPE : {dpe}]"
+                            price = int(raw.get("price") or 0)
+                            surf_obj = raw.get("surface") or {}
+                            surface = float(surf_obj.get("main") or 0.0)
+                            if price < min_price_floor or price > max_budget or surface < min_surface:
+                                continue
 
-                        has_parking = _detect_parking_in_text(f"{full_title} {full_desc}")
+                            prop_raw = str(raw.get("propertyType") or "").upper()
+                            prop_type = "Maison" if "HOUSE" in prop_raw else "Appartement"
+                            if selected_types and prop_type.lower() not in selected_types:
+                                continue
 
-                        ad_url = str(item.get("url") or f"https://www.seloger.com/annonce/achat/{ad_id_str}")
-                        if ad_url.startswith("/"):
-                            ad_url = "https://www.seloger.com" + ad_url
+                            rooms = int(raw.get("nbroom") or 0)
+                            bedrooms = int(raw.get("nbbedroom") or 0)
 
-                        src_tag = f"SeLoger ({agency_title})"
-                        if used_playwright:
-                            src_tag += " [Playwright]"
+                            loc_addr = (item.get("location") or {}).get("address") or {}
+                            ad_city = _canonical_city_name(str(loc_addr.get("city") or city).strip(), cities)
+                            if is_suggestion and not _city_matches_targets(ad_city, cities):
+                                continue
+                            if not _city_matches_targets(ad_city, cities):
+                                continue
 
-                        results.append(
-                            {
-                                "external_id": f"seloger-{ad_id_str}",
-                                "source": src_tag,
-                                "url": ad_url,
-                                "title": full_title,
-                                "property_type": prop_type,
-                                "price": price,
-                                "surface": surface,
-                                "rooms": rooms,
-                                "city": ad_city,
-                                "postal_code": zip_code,
-                                "description": full_desc or full_title,
-                                "dpe": dpe,
-                                "has_parking": has_parking,
-                            }
-                        )
-            except Exception:
-                continue
+                            ad_city_meta = _get_city_meta(ad_city)
+                            zip_code = str(loc_addr.get("zipCode") or ad_city_meta.get("postal_code", "59000"))
+                            district = str(loc_addr.get("district") or "").strip()
+
+                            main_desc = item.get("mainDescription") or {}
+                            headline = _clean_html_text(str(main_desc.get("headline") or ""))
+                            desc_body = _clean_html_text(str(main_desc.get("description") or ""))
+
+                            if bedrooms == 0:
+                                bedrooms = _extract_bedrooms_from_text(f"{headline} {desc_body}", rooms)
+
+                            if min_rooms > 0 and rooms > 0 and rooms < min_rooms:
+                                continue
+                            if min_bedrooms > 0 and bedrooms > 0 and bedrooms < min_bedrooms:
+                                continue
+
+                            seen_ids.add(ad_id_str)
+                            page_new_count += 1
+
+                            hard_facts = item.get("hardFacts") or {}
+                            keyfacts = [str(kf) for kf in (hard_facts.get("keyfacts") or [])]
+                            if bedrooms and not any("chambre" in kf.lower() for kf in keyfacts):
+                                keyfacts.append(f"{bedrooms} chambres")
+
+                            provider = item.get("provider") or {}
+                            agency_card = provider.get("intermediaryCard") or {}
+                            agency_title = str(agency_card.get("title") or "Agence SeLoger").strip()
+
+                            full_title = (
+                                headline
+                                if len(headline) > 12
+                                else f"{prop_type} {rooms} pièces {surface:g} m² - {ad_city}"
+                            )
+                            if district and district.lower() not in full_title.lower():
+                                full_title += f" ({district})"
+
+                            raw_energy = str(item.get("energyClass") or "").strip().upper()
+                            if raw_energy in ("A", "B", "C", "D", "E", "F", "G"):
+                                dpe = raw_energy
+                            else:
+                                m_dpe = re.search(
+                                    r"\bdpe\s*[:\-]?\s*([a-g])\b",
+                                    f"{full_title} {desc_body}",
+                                    re.IGNORECASE,
+                                )
+                                dpe = m_dpe.group(1).upper() if m_dpe else "Non renseigné"
+
+                            full_desc = desc_body
+                            if keyfacts:
+                                full_desc += f" [Caractéristiques SeLoger : {', '.join(keyfacts)}]"
+                            if surf_obj.get("plot"):
+                                full_desc += f" [Terrain : {surf_obj.get('plot')} m²]"
+                            if dpe != "Non renseigné":
+                                full_desc += f" [DPE : {dpe}]"
+
+                            if detect_unavailable_reason(full_title, full_desc, tx_type=tx_type):
+                                continue
+
+                            has_parking = _detect_parking_in_text(f"{full_title} {full_desc}")
+
+                            ad_url = str(item.get("url") or f"https://www.seloger.com/annonce/{'location' if tx_type == 'rent' else 'achat'}/{ad_id_str}")
+                            if ad_url.startswith("/"):
+                                ad_url = "https://www.seloger.com" + ad_url
+
+                            src_tag = f"SeLoger ({agency_title})"
+                            if used_playwright:
+                                src_tag += " [Playwright]"
+
+                            results.append(
+                                {
+                                    "external_id": f"seloger-{ad_id_str}",
+                                    "source": src_tag,
+                                    "url": ad_url,
+                                    "title": full_title,
+                                    "transaction_type": tx_type,
+                                    "property_type": prop_type,
+                                    "price": price,
+                                    "surface": surface,
+                                    "rooms": rooms,
+                                    "bedrooms": bedrooms,
+                                    "city": ad_city,
+                                    "postal_code": zip_code,
+                                    "description": full_desc or full_title,
+                                    "dpe": dpe,
+                                    "has_parking": has_parking,
+                                }
+                            )
+
+                    if page_new_count == 0:
+                        break
+                except Exception:
+                    break
 
     return results
 
 
-def scrape_all_live_sources(criteria: Dict[str, Any]) -> Dict[str, Any]:
+def parse_leboncoin_payload(
+    raw_content: str,
+    criteria: Dict[str, Any],
+    fallback_city: str = "",
+) -> List[Dict[str, Any]]:
     """
-    Exécute le scraping live multi-sources (SeLoger + Bien'ici + Réseaux d'Agences & Orpi)
-    avec résilience réseau et bypass WAF automatique.
+    Extrait et normalise les annonces immobilières LeBonCoin depuis :
+    - une page HTML contenant `<script id="__NEXT_DATA__" type="application/json">`
+    - ou un payload JSON brut de l'API LeBonCoin (`ads` / `props.pageProps.searchData.ads`).
+    Fonctionne aussi bien pour une page de résultats de recherche que pour une fiche annonce unique.
     """
-    seloger_ads = scrape_seloger_live(criteria)
-    bienici_ads = scrape_bienici_live(criteria, limit_per_city=15)
-    orpi_ads = scrape_orpi_live(criteria)
-    combined = seloger_ads + bienici_ads + orpi_ads
+    results: List[Dict[str, Any]] = []
+    if not raw_content or "geo.captcha-delivery.com" in raw_content:
+        return results
+
+    tx_type = "rent" if str(criteria.get("transaction_type", "buy")).strip().lower() in ("rent", "location") else "buy"
+    min_price_floor = 250 if tx_type == "rent" else 70000
+    max_budget = int(criteria.get("max_budget", 1500 if tx_type == "rent" else 280000))
+    min_surface = float(criteria.get("min_surface", 80.0))
+    min_rooms = int(criteria.get("min_rooms", 0) or 0)
+    min_bedrooms = int(criteria.get("min_bedrooms", 0) or 0)
+    cities = criteria.get("cities", list(CITY_METADATA.keys()))
+    selected_types = [t.lower() for t in criteria.get("property_types", ["Maison", "Appartement"])]
+
+    data = None
+    stripped = raw_content.strip()
+    if stripped.startswith("{"):
+        try:
+            data = json.loads(stripped)
+        except Exception:
+            data = None
+
+    if data is None:
+        soup = BeautifulSoup(raw_content, "html.parser")
+        nd = soup.find("script", id="__NEXT_DATA__")
+        if nd and nd.string:
+            try:
+                data = json.loads(nd.string)
+            except Exception:
+                data = None
+
+    if not isinstance(data, dict):
+        return results
+
+    page_props = (data.get("props") or {}).get("pageProps") or {}
+    search_data = page_props.get("searchData") or data.get("searchData") or {}
+    ads_list = search_data.get("ads") or data.get("ads") or []
+    if not ads_list and page_props.get("ad"):
+        ads_list = [page_props["ad"]]
+
+    for ad in ads_list:
+        if not isinstance(ad, dict):
+            continue
+        list_id = str(ad.get("list_id") or ad.get("id") or "").strip()
+        if not list_id:
+            continue
+        ad_status = str(ad.get("status") or "").strip().lower()
+        if ad_status in ("deleted", "expired", "inactive", "sold", "refused", "paused", "closed"):
+            continue
+
+        # Prix
+        raw_price = ad.get("price")
+        if isinstance(raw_price, list) and raw_price:
+            price = int(raw_price[0] or 0)
+        elif isinstance(raw_price, (int, float)):
+            price = int(raw_price)
+        else:
+            price = 0
+
+        # Attributs LeBonCoin (square, rooms, bedrooms, real_estate_type, energy_rate, etc.)
+        attrs_map: Dict[str, str] = {}
+        attrs_label_map: Dict[str, str] = {}
+        for attr in (ad.get("attributes") or []):
+            if isinstance(attr, dict) and attr.get("key"):
+                k = str(attr["key"])
+                val = str(attr.get("value") or "").strip()
+                lbl = str(attr.get("value_label") or val).strip()
+                attrs_map[k] = val
+                attrs_label_map[k] = lbl
+
+        re_type_val = attrs_map.get("real_estate_type", "")
+        re_type_lbl = attrs_label_map.get("real_estate_type", "").lower()
+        if re_type_val == "1" or "maison" in re_type_lbl:
+            prop_type = "Maison"
+        elif re_type_val == "2" or "appartement" in re_type_lbl:
+            prop_type = "Appartement"
+        else:
+            subject_lower = str(ad.get("subject") or "").lower()
+            prop_type = "Maison" if "maison" in subject_lower else "Appartement"
+
+        if selected_types and prop_type.lower() not in selected_types:
+            continue
+
+        try:
+            surface = float(re.sub(r"[^\d.]", "", attrs_map.get("square", "0")) or 0.0)
+        except Exception:
+            surface = 0.0
+
+        try:
+            rooms = int(re.sub(r"\D", "", attrs_map.get("rooms", "0")) or 0)
+        except Exception:
+            rooms = 0
+
+        try:
+            bedrooms = int(re.sub(r"\D", "", attrs_map.get("bedrooms", "0")) or 0)
+        except Exception:
+            bedrooms = 0
+
+        if price < min_price_floor or price > max_budget or (surface > 0 and surface < min_surface):
+            continue
+
+        loc = ad.get("location") or {}
+        raw_city = str(loc.get("city") or fallback_city or "").strip()
+        ad_city = _canonical_city_name(raw_city, cities)
+        if cities and ad_city and not _city_matches_targets(ad_city, cities):
+            continue
+
+        postal_code = str(loc.get("zipcode") or _get_city_meta(ad_city).get("postal_code", "59000"))
+        district = str(loc.get("district") or "").strip()
+
+        title = _clean_html_text(str(ad.get("subject") or "")).strip()
+        body = _clean_html_text(str(ad.get("body") or "")).strip()
+
+        if bedrooms == 0:
+            bedrooms = _extract_bedrooms_from_text(f"{title} {body}", rooms)
+
+        if min_rooms > 0 and rooms > 0 and rooms < min_rooms:
+            continue
+        if min_bedrooms > 0 and bedrooms > 0 and bedrooms < min_bedrooms:
+            continue
+
+        dpe = str(attrs_map.get("energy_rate") or "").strip().upper()
+        if dpe not in ("A", "B", "C", "D", "E", "F", "G"):
+            m_dpe = re.search(r"\bdpe\s*[:\-]?\s*([a-g])\b", f"{title} {body}", re.IGNORECASE)
+            dpe = m_dpe.group(1).upper() if m_dpe else "Non renseigné"
+
+        extra_lbc = []
+        if bedrooms:
+            extra_lbc.append(f"{bedrooms} chambres")
+        if attrs_label_map.get("outside_access"):
+            extra_lbc.append(f"Extérieur : {attrs_label_map['outside_access']}")
+        if attrs_label_map.get("ges"):
+            extra_lbc.append(f"GES : {attrs_label_map['ges']}")
+        if attrs_label_map.get("immo_sell_type"):
+            extra_lbc.append(f"Type de vente : {attrs_label_map['immo_sell_type']}")
+
+        full_desc = body or title
+        if extra_lbc:
+            full_desc += f" [Attributs LeBonCoin : {', '.join(extra_lbc)}]"
+
+        if detect_unavailable_reason(title, full_desc, tx_type=tx_type):
+            continue
+
+        has_parking_attr = any(
+            k in attrs_label_map.get("outside_access", "").lower()
+            or k in attrs_label_map.get("custom_ref", "").lower()
+            for k in PARKING_KEYWORDS
+        )
+        has_parking = _detect_parking_in_text(f"{title} {full_desc}", explicit_flag=has_parking_attr)
+
+        owner = ad.get("owner") or {}
+        owner_type = str(owner.get("type") or "").lower()
+        owner_name = str(owner.get("name") or "").strip()
+        if owner_type == "private":
+            source_label = f"LeBonCoin (Particulier{' - ' + owner_name if owner_name else ''})"
+        else:
+            source_label = f"LeBonCoin (Pro{' - ' + owner_name if owner_name else ''})"
+
+        ad_url = str(ad.get("url") or f"https://www.leboncoin.fr/ad/ventes_immobilieres/{list_id}")
+        if district and district.lower() not in title.lower():
+            title = f"{title} ({district})"
+
+        results.append(
+            {
+                "external_id": f"lbc-{list_id}",
+                "source": source_label,
+                "url": ad_url,
+                "title": title or f"{prop_type} {rooms} pièces {surface:g} m² - {ad_city}",
+                "transaction_type": tx_type,
+                "property_type": prop_type,
+                "price": price,
+                "surface": surface,
+                "rooms": rooms,
+                "bedrooms": bedrooms,
+                "city": ad_city,
+                "postal_code": postal_code,
+                "description": full_desc,
+                "dpe": dpe,
+                "has_parking": has_parking,
+            }
+        )
+
+    return results
+
+
+def scrape_leboncoin_live(criteria: Dict[str, Any], timeout: float = 12.0) -> Tuple[List[Dict[str, Any]], bool]:
+    """
+    Tente de scraper en direct les annonces LeBonCoin (Particuliers & Pros) pour chaque commune ciblée.
+    Retourne `(annonces, anti_bot_detected)` : si la protection anti-bot DataDome de LeBonCoin bloque
+    l'accès automatisé (HTTP 403 / page de vérification), le scraper s'arrête proprement sans tenter
+    de contourner ou résoudre le challenge, et signale à l'utilisateur qu'il peut ouvrir les liens
+    directs LeBonCoin ou importer une annonce dans l'onglet dédié.
+    """
+    results: List[Dict[str, Any]] = []
+    seen_ids = set()
+    anti_bot_blocked = False
+
+    tx_type = "rent" if str(criteria.get("transaction_type", "buy")).strip().lower() in ("rent", "location") else "buy"
+    min_price_floor = 250 if tx_type == "rent" else 70000
+    max_budget = int(criteria.get("max_budget", 1500 if tx_type == "rent" else 280000))
+    min_surface = int(criteria.get("min_surface", 80))
+    min_rooms = int(criteria.get("min_rooms", 0) or 0)
+    min_bedrooms = int(criteria.get("min_bedrooms", 0) or 0)
+    cities = criteria.get("cities", list(CITY_METADATA.keys()))
+    selected_types = [t.lower() for t in criteria.get("property_types", ["Maison", "Appartement"])]
+
+    lbc_cat = "10" if tx_type == "rent" else "9"
+    re_types = []
+    if "maison" in selected_types:
+        re_types.append("1")
+    if "appartement" in selected_types:
+        re_types.append("2")
+    if not re_types:
+        re_types = ["1", "2"]
+
+    lbc_cookie = os.getenv("LEBONCOIN_COOKIE", "").strip()
+    headers = get_browser_headers(accept_json=False)
+    if lbc_cookie:
+        headers["Cookie"] = lbc_cookie
+
+    with httpx.Client(headers=headers, timeout=timeout, follow_redirects=True, verify=False) as client:
+        for city in cities:
+            meta = _get_city_meta(city)
+            cp = meta.get("postal_code", "59000")
+            loc_param = urllib.parse.quote(f"{city}_{cp}")
+            url = (
+                f"https://www.leboncoin.fr/recherche?category={lbc_cat}&locations={loc_param}"
+                f"&price={min_price_floor}-{max_budget}&square={min_surface}-max"
+                f"&real_estate_type={','.join(re_types)}"
+            )
+            if min_rooms > 0:
+                url += f"&rooms={min_rooms}-max"
+            if min_bedrooms > 0:
+                url += f"&bedrooms={min_bedrooms}-max"
+
+            try:
+                resp = robust_http_get(client, url, max_retries=0)
+                if not resp:
+                    continue
+                body_text = resp.text or ""
+                if resp.status_code == 403 or "geo.captcha-delivery.com" in body_text:
+                    anti_bot_blocked = True
+                    # Ne pas insister si le portail présente un challenge anti-bot DataDome
+                    break
+
+                if resp.status_code == 200 and "__NEXT_DATA__" in body_text:
+                    city_ads = parse_leboncoin_payload(body_text, criteria, fallback_city=city)
+                    for ad in city_ads:
+                        if ad["external_id"] not in seen_ids:
+                            seen_ids.add(ad["external_id"])
+                            results.append(ad)
+            except Exception:
+                continue
+
+    return results, anti_bot_blocked
+
+
+def check_single_listing_availability(client: httpx.Client, listing: Dict[str, Any]) -> Tuple[Optional[bool], str]:
+    """
+    Vérifie si une annonce est toujours disponible :
+    1. Contrôle textuel instantané (titre + description).
+    2. Vérification API directe pour Bien'ici (`realEstateAd.json?id=...`) et fiche HTML pour Orpi.
+    Ne requiert jamais les portails protégés par DataDome (SeLoger / LeBonCoin).
+    Retourne `(True, "")` si confirmée disponible, `(False, raison)` si confirmée indisponible,
+    ou `(None, "")` si la vérification est impossible ou non concluante (erreur transitoire / DataDome).
+    """
+    tx_type = "rent" if str(listing.get("transaction_type") or "buy").strip().lower() in ("rent", "location") else "buy"
+    title = str(listing.get("title") or "")
+    desc = str(listing.get("description") or "")
+
+    text_reason = detect_unavailable_reason(title, desc, tx_type=tx_type)
+    if text_reason:
+        return False, text_reason
+
+    ext_id = str(listing.get("external_id") or "").strip()
+    if ext_id.startswith("bienici-"):
+        ad_id = ext_id[len("bienici-") :]
+        if not ad_id:
+            return None, ""
+        url = f"https://www.bienici.com/realEstateAd.json?id={urllib.parse.quote(ad_id)}"
+        try:
+            resp = robust_http_get(client, url, max_retries=1)
+            if not resp:
+                return None, ""
+            if resp.status_code in (404, 410):
+                return False, f"Annonce supprimée de Bien'ici (HTTP {resp.status_code})"
+            if resp.status_code != 200:
+                return None, ""
+            data = resp.json()
+            if not isinstance(data, dict):
+                return None, ""
+            st = data.get("status")
+            if isinstance(st, dict):
+                if st.get("onTheMarket") is False:
+                    return False, "Retirée du marché (Bien'ici)"
+                if st.get("closedByUser") is True:
+                    return False, "Clôturée par l'annonceur (Bien'ici)"
+            if data.get("isSold") is True or data.get("sold") is True:
+                return False, "Bien vendu (Bien'ici)"
+            live_title = str(data.get("title") or title)
+            live_desc = _clean_html_text(str(data.get("description") or ""))
+            live_reason = detect_unavailable_reason(live_title, live_desc, tx_type=tx_type)
+            if live_reason:
+                return False, live_reason
+            return True, ""
+        except Exception:
+            return None, ""
+
+    if ext_id.startswith("orpi-"):
+        ad_url = str(listing.get("url") or "").strip()
+        if not ad_url:
+            return None, ""
+        try:
+            resp = robust_http_get(client, ad_url, max_retries=1)
+            if not resp:
+                return None, ""
+            if resp.status_code in (404, 410):
+                return False, f"Annonce retirée d'Orpi (HTTP {resp.status_code})"
+            if resp.status_code != 200:
+                return None, ""
+            final_url = str(getattr(resp, "url", ad_url) or ad_url)
+            if "/annonce-" not in final_url.lower():
+                return False, "Annonce redirigée / retirée d'Orpi"
+            html = resp.text or ""
+            if re.search(r'\bSold\s*=\s*1\b|"sold"\s*:\s*true|\bisSold\s*:\s*true\b', html, re.IGNORECASE):
+                return False, "Bien vendu (Orpi)"
+            soup = BeautifulSoup(html, "html.parser")
+            cms_div = soup.find("div", class_=re.compile(r"\bs-cms\b"))
+            live_desc = _clean_html_text(str(cms_div)) if cms_div else ""
+            live_reason = detect_unavailable_reason(title, live_desc, tx_type=tx_type)
+            if live_reason:
+                return False, live_reason
+            return True, ""
+        except Exception:
+            return None, ""
+
+    return None, ""
+
+
+def check_listings_availability_batch(
+    listings: List[Dict[str, Any]],
+    max_workers: int = 8,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+) -> List[Tuple[int, bool, str]]:
+    """
+    Vérifie en parallèle la disponibilité réelle d'une liste d'annonces en base
+    (contrôle textuel + API Bien'ici + fiches Orpi, sans requêter les portails DataDome).
+    Retourne uniquement les statuts confirmés `(listing_id, is_available, reason)`.
+    """
+    results: List[Tuple[int, bool, str]] = []
+    total = len(listings)
+    if total == 0:
+        return results
+
+    workers = max(1, min(max_workers, 8))
+    headers = get_browser_headers(accept_json=False)
+    with httpx.Client(headers=headers, timeout=10.0, follow_redirects=True, verify=False) as client:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_item = {
+                executor.submit(check_single_listing_availability, client, item): item
+                for item in listings
+            }
+            done = 0
+            for future in concurrent.futures.as_completed(future_to_item):
+                item = future_to_item[future]
+                done += 1
+                try:
+                    is_avail, reason = future.result()
+                    if is_avail is not None and item.get("id") is not None:
+                        results.append((int(item["id"]), bool(is_avail), str(reason or "")))
+                except Exception:
+                    pass
+                if on_progress:
+                    try:
+                        on_progress(done, total)
+                    except Exception:
+                        pass
+    return results
+
+
+def scrape_all_live_sources(
+    criteria: Dict[str, Any],
+    existing_orpi_cache: Optional[Dict[str, Tuple[str, str, str, Optional[int]]]] = None,
+) -> Dict[str, Any]:
+    """
+    Exécute le scraping live multi-sources (SeLoger + Bien'ici + Réseaux d'Agences + Orpi + LeBonCoin)
+    EN PARALLÈLE sur 4 threads avec sessions HTTP/2 Keep-Alive et cache d'enrichissement Orpi.
+    """
+    seloger_ads: List[Dict[str, Any]] = []
+    bienici_ads: List[Dict[str, Any]] = []
+    orpi_ads: List[Dict[str, Any]] = []
+    lbc_ads: List[Dict[str, Any]] = []
+    lbc_blocked = False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        f_seloger = executor.submit(scrape_seloger_live, criteria)
+        f_bienici = executor.submit(scrape_bienici_live, criteria, None)
+        f_orpi = executor.submit(scrape_orpi_live, criteria, 12.0, existing_orpi_cache)
+        f_lbc = executor.submit(scrape_leboncoin_live, criteria)
+
+        try:
+            seloger_ads = f_seloger.result()
+        except Exception:
+            seloger_ads = []
+
+        try:
+            bienici_ads = f_bienici.result()
+        except Exception:
+            bienici_ads = []
+
+        try:
+            orpi_ads = f_orpi.result()
+        except Exception:
+            orpi_ads = []
+
+        try:
+            lbc_ads, lbc_blocked = f_lbc.result()
+        except Exception:
+            lbc_ads, lbc_blocked = [], False
+
+    combined = seloger_ads + bienici_ads + orpi_ads + lbc_ads
     return {
         "ads": combined,
         "stats": {
             "seloger": len(seloger_ads),
             "bienici_agences": len(bienici_ads),
             "orpi_direct": len(orpi_ads),
+            "leboncoin": len(lbc_ads),
+            "leboncoin_blocked": lbc_blocked,
             "total": len(combined),
         },
     }
@@ -1008,12 +1787,20 @@ def scrape_all_live_sources(criteria: Dict[str, Any]) -> Dict[str, Any]:
 
 def build_portal_search_links(criteria: Dict[str, Any]) -> Dict[str, List[Dict[str, str]]]:
     """
-    Génère les liens directs vers les recherches pré-filtrées (Budget, Surface, Ville)
+    Génère les liens directs vers les recherches pré-filtrées (Transaction, Budget, Surface, Pièces, Chambres, Ville)
     sur Bien'ici, Orpi, LeBonCoin et SeLoger pour chaque ville sélectionnée.
     """
-    max_budget = int(criteria.get("max_budget", 280000))
+    tx_type = "rent" if str(criteria.get("transaction_type", "buy")).strip().lower() in ("rent", "location") else "buy"
+    max_budget = int(criteria.get("max_budget", 1500 if tx_type == "rent" else 280000))
     min_surface = int(criteria.get("min_surface", 80))
+    min_rooms = int(criteria.get("min_rooms", 0) or 0)
+    min_bedrooms = int(criteria.get("min_bedrooms", 0) or 0)
     cities = criteria.get("cities", list(CITY_METADATA.keys()))
+
+    bienici_tx = "location" if tx_type == "rent" else "achat"
+    orpi_tx = "rent" if tx_type == "rent" else "buy"
+    lbc_cat = "10" if tx_type == "rent" else "9"
+    seloger_dist = "Rent" if tx_type == "rent" else "Buy"
 
     links_by_city: Dict[str, List[Dict[str, str]]] = {}
     for city in cities:
@@ -1023,27 +1810,42 @@ def build_portal_search_links(criteria: Dict[str, Any]) -> Dict[str, List[Dict[s
         orpi_slug = meta.get("orpi_slug", slug)
 
         bienici_url = (
-            f"https://www.bienici.com/recherche/achat/{slug}"
+            f"https://www.bienici.com/recherche/{bienici_tx}/{slug}"
             f"?prix-max={max_budget}&surface-min={min_surface}&parking=true"
         )
+        if min_rooms > 0:
+            bienici_url += f"&nb-pieces-min={min_rooms}"
+        if min_bedrooms > 0:
+            bienici_url += f"&nb-chambres-min={min_bedrooms}"
+
         orpi_url = (
-            f"https://www.orpi.com/recherche/buy?locations[0][value]={orpi_slug}"
+            f"https://www.orpi.com/recherche/{orpi_tx}?locations[0][value]={orpi_slug}"
             f"&maxPrice={max_budget}&minSurface={min_surface}"
         )
+
         leboncoin_query = urllib.parse.quote(f"{city} {cp}")
         leboncoin_url = (
-            f"https://www.leboncoin.fr/recherche?category=9&locations={leboncoin_query}"
+            f"https://www.leboncoin.fr/recherche?category={lbc_cat}&locations={leboncoin_query}"
             f"&price=min-{max_budget}&square={min_surface}-max&real_estate_type=1,2"
         )
+        if min_rooms > 0:
+            leboncoin_url += f"&rooms={min_rooms}-max"
+        if min_bedrooms > 0:
+            leboncoin_url += f"&bedrooms={min_bedrooms}-max"
+
         seloger_place = meta.get("seloger_place_id", "")
         if seloger_place:
             seloger_url = (
-                f"https://www.seloger.com/classified-search?distributionTypes=Buy"
+                f"https://www.seloger.com/classified-search?distributionTypes={seloger_dist}"
                 f"&estateTypes=House,Apartment&locations={seloger_place}"
                 f"&priceMax={max_budget}&spaceMin={min_surface}"
             )
+            if min_rooms > 0:
+                seloger_url += f"&nbOfRoomsMin={min_rooms}"
+            if min_bedrooms > 0:
+                seloger_url += f"&nbOfBedroomsMin={min_bedrooms}"
         else:
-            seloger_url = f"https://www.seloger.com/immobilier/achat/immo-{slug}/"
+            seloger_url = f"https://www.seloger.com/immobilier/{bienici_tx}/immo-{slug}/"
 
         links_by_city[city] = [
             {"portail": "Bien'ici (Agrégateur)", "url": bienici_url},

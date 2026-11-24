@@ -2,8 +2,11 @@
 
 CREATE TABLE IF NOT EXISTS search_criteria (
     id INTEGER PRIMARY KEY CHECK (id = 1),
+    transaction_type TEXT NOT NULL DEFAULT 'buy',
     max_budget INTEGER NOT NULL DEFAULT 280000,
     min_surface REAL NOT NULL DEFAULT 80.0,
+    min_rooms INTEGER NOT NULL DEFAULT 0,
+    min_bedrooms INTEGER NOT NULL DEFAULT 0,
     property_types TEXT NOT NULL DEFAULT 'Maison,Appartement',
     cities TEXT NOT NULL DEFAULT 'Croix,Wasquehal,Roubaix,Villeneuve-d''Ascq,Marcq-en-Barœul',
     require_parking INTEGER NOT NULL DEFAULT 1,
@@ -16,10 +19,10 @@ CREATE TABLE IF NOT EXISTS search_criteria (
 );
 
 INSERT OR IGNORE INTO search_criteria (
-    id, max_budget, min_surface, property_types, cities,
+    id, transaction_type, max_budget, min_surface, min_rooms, min_bedrooms, property_types, cities,
     require_parking, exclude_dpe_fg, exclude_occupied, exclude_heavy_works, exclude_copro_issues
 ) VALUES (
-    1, 280000, 80.0, 'Maison,Appartement',
+    1, 'buy', 280000, 80.0, 0, 0, 'Maison,Appartement',
     'Croix,Wasquehal,Roubaix,Villeneuve-d''Ascq,Marcq-en-Barœul',
     1, 1, 1, 1, 1
 );
@@ -30,10 +33,12 @@ CREATE TABLE IF NOT EXISTS listings (
     source TEXT NOT NULL,
     url TEXT UNIQUE NOT NULL,
     title TEXT NOT NULL,
+    transaction_type TEXT DEFAULT 'buy',
     property_type TEXT DEFAULT 'Autre',
     price INTEGER NOT NULL,
     surface REAL NOT NULL,
     rooms INTEGER DEFAULT 0,
+    bedrooms INTEGER DEFAULT 0,
     city TEXT NOT NULL,
     postal_code TEXT DEFAULT '',
     description TEXT NOT NULL,
@@ -60,6 +65,9 @@ CREATE TABLE IF NOT EXISTS listings (
     followup_notes TEXT DEFAULT '',
     selected_at TIMESTAMP DEFAULT NULL,
     quarantined_at TIMESTAMP DEFAULT NULL,
+    is_available INTEGER NOT NULL DEFAULT 1,
+    unavailable_reason TEXT DEFAULT '',
+    availability_checked_at TIMESTAMP DEFAULT NULL,
     scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     analyzed_at TIMESTAMP DEFAULT NULL
 );
@@ -69,3 +77,4 @@ CREATE INDEX IF NOT EXISTS idx_listings_score ON listings(ai_score DESC);
 CREATE INDEX IF NOT EXISTS idx_listings_city ON listings(city);
 CREATE INDEX IF NOT EXISTS idx_listings_selected ON listings(is_selected);
 CREATE INDEX IF NOT EXISTS idx_listings_quarantined ON listings(is_quarantined);
+CREATE INDEX IF NOT EXISTS idx_listings_available ON listings(is_available);
